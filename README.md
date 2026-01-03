@@ -289,7 +289,7 @@ await bot.change_presence(activity=discord.Game(name="!help | Multi-Server Bot")
 
 Need help? Have suggestions?
 - Create an issue on GitHub
-- Join our support server: [Your Discord Invite]
+- Join our support server: [https://discord.gg/PMDtKbUfEA]
 
 ## 📜 License
 
