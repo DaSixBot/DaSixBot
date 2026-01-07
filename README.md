@@ -165,7 +165,7 @@ Your bot is ready to use immediately. We provide:
 
 📧 Email: support@dasixbot.xyz  
 💬 Discord: [https://discord.gg/PMDtKbUfEA]  
-🌐 Website: dasixbot.com
+🌐 Website: [https://dasixbot.xyz]
 
 ### Special Launch Offer
 **Get 1 month free when you sign up for Tier 3!**  
