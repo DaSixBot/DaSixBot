@@ -1,322 +1,198 @@
-# 🤖 Multi-Purpose Discord Bot
+# 🚀 Dasixbot Hosting Services
 
-A feature-rich, public Discord bot with moderation, verification, tickets, payments tracking, giveaways, and more!
-
-## ✨ Features
-
-### 🛡️ **Moderation & Security**
-- **Anti-Spam System**: Automatically detects and mutes spammers
-- **Verification System**: Secure code-based verification for new members
-- **Silent Channels**: Channels where only admins can trigger @everyone notifications
-- **Message Deletion**: Bulk delete messages
-
-### 🎫 **Support System**
-- **Advanced Ticket System**: Create categorized support tickets with priorities
-- **Ticket Transcripts**: Automatically generate HTML transcripts when tickets close
-- **Ticket Management**: Claim, prioritize, add users to tickets
-
-### 💰 **Payment Tracking**
-- Track payments owed to team members
-- Add, remove, and manage payment balances
-- Visual payment dashboard
-
-### 🎉 **Engagement Features**
-- **Giveaway System**: Host timed giveaways with multiple winners
-- **Coin Flip**: Simple heads/tails game
-- **Custom Rules**: Display server rules
-- **Announcements**: Create formatted announcements
-
-### ⚙️ **Server Management**
-- **Interactive Setup**: Easy server configuration wizard
-- **Stats Channel**: Auto-updating member count in voice channel
-- **Per-Server Configuration**: Each server has its own settings
-
-## 🚀 Setup Instructions
-
-### Prerequisites
-- Python 3.8 or higher
-- Discord Bot Token ([Get one here](https://discord.com/developers/applications))
-
-### Installation
-
-1. **Clone or download the bot files**
-
-2. **Install dependencies**
-```bash
-pip install -r requirements.txt
-```
-
-3. **Configure the bot**
-   - Copy `.env.example` to `.env`
-   - Add your Discord bot token:
-```env
-DISCORD_BOT_TOKEN=your_bot_token_here
-```
-
-4. **Enable necessary bot intents**
-   - Go to [Discord Developer Portal](https://discord.com/developers/applications)
-   - Select your bot
-   - Go to "Bot" section
-   - Enable these Privileged Gateway Intents:
-     - ✅ PRESENCE INTENT
-     - ✅ SERVER MEMBERS INTENT
-     - ✅ MESSAGE CONTENT INTENT
-
-5. **Invite the bot to your server**
-   - Use this URL (replace YOUR_BOT_ID with your actual bot ID):
-   ```
-   https://discord.com/oauth2/authorize?client_id=YOUR_BOT_ID&permissions=8&scope=bot
-   ```
-
-6. **Run the bot**
-```bash
-python public_discord_bot.py
-```
-
-## 📋 Command List
-
-### Basic Commands (Everyone)
-- `!help` - Display all commands
-- `!rules` - Show server rules
-- `!ticket` - Create a support ticket
-- `!flip` - Flip a coin
-- `!pay_list` - View payment balances
-
-### Setup (Administrator Only)
-- `!setup` - Interactive server configuration wizard
-  - Set verified role
-  - Set announcement channel
-  - Set stats voice channel
-
-### Moderation (Administrator)
-- `!delete <number>` - Delete specified number of messages
-- `!announcement` - Create an announcement
-- `!verify [member]` - Manually verify a member
-- `!sendverify` - Post verification button
-
-### Anti-Spam (Administrator)
-- `!spam_info` - View current spam settings
-- `!spam_config <msgs> <interval> <timeout>` - Configure spam detection
-- `!unmute_user <member>` - Manually unmute a user
-
-### Silent Channels (Administrator)
-- `!silent_channels` - View all silent channels
-- `!enable_silent [channel]` - Make a channel silent by default
-- `!disable_silent [channel]` - Disable silent mode
-
-### Payment Tracking (Administrator)
-- `!pay_add <username> <amount>` - Add amount owed
-- `!pay <username> <amount>` - Record a payment (subtracts from balance)
-- `!pay_remove <username>` - Remove someone from tracker
-- `!pay_reset` - Reset all payment data (with confirmation)
-
-### Giveaways (Administrator)
-- `!gstart <duration> <winners> <prize>` - Start a giveaway
-  - Example: `!gstart 1h 2 $100 Prize`
-  - Duration format: `10s`, `30m`, `1h`, `2d`
-
-## 🎫 Ticket System
-
-### For Users:
-1. Use `!ticket` command to see the support button
-2. Click "Create Ticket"
-3. Select a category
-4. Fill out the form with title and details
-5. A private channel will be created for you
-
-### For Staff:
-- **Claim**: Click "✋ Claim" to assign yourself
-- **Priority**: Click "⚠️ Priority" to change urgency
-- **Add User**: Click "📋 Add User" to add someone to the ticket
-- **Close**: Click "🔒 Close" to close and generate transcript
-
-Transcripts are automatically saved to the `#ticket-logs` channel.
-
-## 🔐 Verification System
-
-### Setup:
-1. Run `!setup` and set a verified role
-2. Run `!sendverify` in your verification channel
-
-### How it works:
-1. New members click the "Verify" button
-2. They receive a 6-digit code via DM (or privately if DMs are closed)
-3. They type the code in the verification channel
-4. The code is automatically deleted for security
-5. They receive the verified role
-
-### Features:
-- Account age checking
-- Risk level assessment
-- Suspicious account logging
-- Auto-welcome messages
-
-## 🔕 Silent Channels
-
-Silent channels are channels where:
-- Regular users **cannot** trigger @everyone notifications
-- Only **administrators** can ping @everyone
-- Admin messages automatically add @everyone
-
-**Use case**: Announcement channels where you don't want members spamming notifications
-
-**Setup**:
-```
-!enable_silent #your-channel
-```
-
-## 💰 Payment Tracking
-
-Perfect for tracking payments to editors, moderators, or team members.
-
-**Example workflow**:
-```
-!pay_add John $500          # John is now owed $500
-!pay_add John $200          # John is now owed $700
-!pay John $300              # Paid John $300, now owed $400
-!pay John $400              # Paid John $400, balance cleared!
-```
-
-## ⚙️ Configuration
-
-Each server gets its own configuration stored in `server_config.json`:
-
-```json
-{
-  "123456789": {
-    "verified_role_id": 987654321,
-    "announcement_channel_id": 876543210,
-    "stats_channel_id": 765432109
-  }
-}
-```
-
-Run `!setup` to easily configure your server.
-
-## 📊 Member Stats
-
-Set up a voice channel to display your server's member count:
-1. Create a voice channel
-2. Lock it so members can't join
-3. Run `!setup` and provide the channel
-4. The bot will update it every 10 minutes: "📊 Members: 1,234"
-
-## 🛡️ Anti-Spam System
-
-Default settings:
-- **5 messages** per **5 seconds** = **5 minute mute**
-
-Customize with:
-```
-!spam_config 5 5 300
-```
-
-Features:
-- Automatic message deletion
-- DM notification to spammer
-- Staff alert in channel
-- Mod logging
-
-## 📁 File Structure
-
-```
-.
-├── public_discord_bot.py       # Main bot file
-├── requirements.txt            # Python dependencies
-├── .env.example               # Environment template
-├── .env                       # Your config (create this)
-├── payments.json              # Payment data (auto-created)
-├── tickets.json               # Ticket data (auto-created)
-├── verifications.json         # Verification data (auto-created)
-└── server_config.json         # Server configs (auto-created)
-```
-
-## 🔧 Troubleshooting
-
-### Bot won't start
-- Check your token in `.env`
-- Ensure you have Python 3.8+
-- Install dependencies: `pip install -r requirements.txt`
-
-### Verification not working
-- Run `!setup` and configure the verified role
-- Make sure the bot has permission to manage roles
-- Ensure the bot's role is **above** the verified role
-
-### Commands not responding
-- Ensure Message Content Intent is enabled
-- Check bot permissions in the server
-- Make sure you're using the correct prefix: `!`
-
-### Stats channel not updating
-- Make sure the channel is a **voice channel**
-- The bot needs permission to manage the channel
-- Updates happen every 10 minutes
-
-## 🔒 Security Notes
-
-- **Never share your bot token**
-- Keep your `.env` file private
-- The bot uses DNS override for connection stability
-- Verification codes expire in 15 minutes
-- Failed verification attempts are limited to 3
-
-## 📝 Customization
-
-### Change Command Prefix
-Line 140:
-```python
-bot = commands.Bot(command_prefix="!", intents=intents)
-```
-
-### Change Anti-Spam Settings
-Line 151-155:
-```python
-anti_spam = AntiSpamSystem(
-    messages_per_interval=5,
-    interval_seconds=5,
-    timeout_seconds=300
-)
-```
-
-### Change Bot Status
-Line 238:
-```python
-await bot.change_presence(activity=discord.Game(name="!help | Multi-Server Bot"))
-```
-
-## 🤝 Support
-
-Need help? Have suggestions?
-- Create an issue on GitHub
-- Join our support server: [https://discord.gg/PMDtKbUfEA]
-
-## 📜 License
-
-This bot is provided as-is for public use. Feel free to modify and distribute.
-
-## 🌟 Features Coming Soon
-
-- [ ] Moderation logs
-- [ ] Starboard system
-- [ ] Custom welcome messages
-- [ ] Reaction roles
-- [ ] Auto-moderation (links, profanity, etc.)
-- [ ] Music player
-- [ ] Economy system
-- [ ] Leveling system
-
-## 📊 Bot Statistics
-
-Track your bot's performance:
-- Multi-server support ✅
-- Per-server configuration ✅
-- Persistent data storage ✅
-- Auto-reconnection ✅
-- Error handling ✅
+Professional Discord bot hosting with full setup and management included. No technical knowledge required!
 
 ---
 
-**Made with ❤️ for the Discord community**
+## 💎 Pricing Tiers
 
-*This bot is not affiliated with any casino, gambling site, or commercial entity. It's a free, public bot for community use.*
+### **Tier 1 - Basic Hosting**
+### $10/month
+
+**What's Included:**
+- ✅ 24/7 bot hosting on reliable servers
+- ✅ Basic bot setup and configuration
+- ✅ All core features enabled:
+  - Moderation & anti-spam
+  - Verification system
+  - Support ticket system
+  - Payment tracking
+  - Giveaway system
+  - Member stats channel
+- ✅ Bot updates and maintenance
+- ✅ Basic support via Discord
+
+**Perfect for:** Small servers getting started with automation
+
+---
+
+### **Tier 2 - Advanced Hosting**
+### $25/month
+
+**Everything in Tier 1, plus:**
+- ✅ Advanced bot configuration and customization
+- ✅ Custom command prefix
+- ✅ Personalized bot status message
+- ✅ Custom anti-spam settings
+- ✅ Custom embed colors and branding
+- ✅ Multiple ticket categories tailored to your server
+- ✅ Custom welcome messages
+- ✅ Priority support response
+- ✅ Weekly performance reports
+
+**Perfect for:** Growing communities that need customization
+
+---
+
+### **Tier 3 - Premium Hosting + Website**
+### $50/month
+
+**Everything in Tier 2, plus:**
+- ✅ **Fully functional website with live leaderboard**
+- ✅ **Custom domain included** (yourserver.com)
+- ✅ Real-time wager race tracking
+- ✅ Professional leaderboard display
+- ✅ Automatic stat updates from Dasixbot
+- ✅ Responsive design (mobile-friendly)
+- ✅ Custom branding and colors
+- ✅ SSL certificate (secure HTTPS)
+- ✅ Website hosting and maintenance
+- ✅ VIP priority support (< 2 hour response)
+- ✅ Monthly strategy consultation call
+
+**Perfect for:** Established communities wanting a complete web presence
+
+---
+
+## 🎯 Feature Comparison
+
+| Feature | Tier 1 | Tier 2 | Tier 3 |
+|---------|--------|--------|--------|
+| 24/7 Bot Hosting | ✅ | ✅ | ✅ |
+| Basic Setup | ✅ | ✅ | ✅ |
+| All Core Features | ✅ | ✅ | ✅ |
+| Custom Configuration | ❌ | ✅ | ✅ |
+| Custom Branding | ❌ | ✅ | ✅ |
+| Priority Support | ❌ | ✅ | ✅ |
+| Website Leaderboard | ❌ | ❌ | ✅ |
+| Custom Domain | ❌ | ❌ | ✅ |
+| Website Hosting | ❌ | ❌ | ✅ |
+| Monthly Consultation | ❌ | ❌ | ✅ |
+
+---
+
+## 📋 All Tiers Include These Bot Features
+
+### 🛡️ **Moderation & Security**
+- Anti-spam system with auto-muting
+- Verification system with code-based authentication
+- Silent channels for announcement control
+- Bulk message deletion
+
+### 🎫 **Support Ticket System**
+- Categorized support tickets with priorities
+- Automatic HTML transcripts
+- Ticket claiming and user management
+- Professional ticket interface
+
+### 💰 **Payment Tracking**
+- Track payments owed to team members
+- Add, remove, and manage balances
+- Visual payment dashboard
+- Payment history logging
+
+### 🎉 **Engagement Tools**
+- Timed giveaway system with multiple winners
+- Coin flip game
+- Custom server rules display
+- Professional announcements
+- Auto-updating member count
+
+### ⚙️ **Server Management**
+- Per-server configuration
+- Easy setup wizard
+- Stats channel with live member count
+- Automatic bot updates
+
+---
+
+## 🚀 Getting Started
+
+### Step 1: Choose Your Tier
+Select the tier that best fits your community's needs.
+
+### Step 2: We Handle Everything
+- We set up the bot with your preferences
+- We configure all features for your server
+- We invite the bot to your Discord
+- (Tier 3) We build and launch your website
+
+### Step 3: You're Live!
+Your bot is ready to use immediately. We provide:
+- Complete walkthrough of all features
+- Admin training for your team
+- Documentation and support
+
+---
+
+## 💬 What Our Clients Say
+
+> *"Went with Tier 3 and couldn't be happier. The leaderboard website makes our wager races so much more professional!"*  
+> — Tliam155
+
+> *"Perfect for our growing server. Setup took 10 minutes and support is always quick."*  
+> — BLMKK
+
+> *"The payment tracking alone is worth it. Keeps everything organized with our editors."*  
+> — XHope
+
+---
+
+## 🔒 Why Choose Dasixbot Hosting?
+
+✅ **No Technical Skills Needed** - We handle all the setup  
+✅ **99.9% Uptime** - Reliable hosting infrastructure  
+✅ **Secure & Private** - Your server data is protected  
+✅ **Regular Updates** - New features added automatically  
+✅ **Scalable** - Upgrade or downgrade anytime  
+✅ **Cancel Anytime** - No long-term contracts  
+
+---
+
+## 📞 Ready to Get Started?
+
+**Contact us to set up your bot today!**
+
+📧 Email: support@dasixbot.xyz  
+💬 Discord: [https://discord.gg/PMDtKbUfEA]  
+🌐 Website: dasixbot.com
+
+### Special Launch Offer
+**Get 1 month free when you sign up for Tier 3!**  
+*Limited time offer - mention this when signing up*
+
+---
+
+## ❓ Frequently Asked Questions
+
+**Q: Can I upgrade my tier later?**  
+A: Yes! You can upgrade or downgrade at any time. Changes take effect immediately.
+
+**Q: What if I have issues with the bot?**  
+A: We provide support for all tiers. Tier 2 gets priority, and Tier 3 gets VIP priority with <2 hour response times.
+
+**Q: Do you offer refunds?**  
+A: Yes, we offer a 7-day money-back guarantee for first-time customers.
+
+**Q: Can I use my own domain for Tier 3?**  
+A: Absolutely! We can use your existing domain or help you get a new one.
+
+**Q: How long does setup take?**  
+A: Basic setup takes 10-30 minutes. Advanced customization (Tier 2) takes 1-2 hours. Full website deployment (Tier 3) takes 24-48 hours.
+
+**Q: What payment methods do you accept?**  
+A: We accept PayPal, credit/debit cards, and cryptocurrency.
+
+---
+
+*Pricing subject to change. All features and specifications accurate as of January 2026.*
