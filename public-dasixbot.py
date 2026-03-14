@@ -1507,7 +1507,7 @@ async def setup(ctx):
     """Interactive server setup"""
     embed = discord.Embed(
         title="⚙️ Server Setup",
-        description="Let's configure the bot for your server!",
+        description="Let's configure the bot for your server!\n\n**You'll need the IDs for your role and channels.**\nEnable Developer Mode in Discord settings to copy IDs.",
         color=discord.Color.blue()
     )
     await ctx.send(embed=embed)
@@ -1517,62 +1517,85 @@ async def setup(ctx):
     def check(m):
         return m.author == ctx.author and m.channel == ctx.channel
     
-    # Verified Role
-    await ctx.send("🔐 **Step 1:** Mention the verified role or type `skip` to skip:")
+    # Step 1: Verified Role ID
+    await ctx.send("🔐 **Step 1:** Paste the **Role ID** for the verified role, or type `skip`:")
     try:
         msg = await bot.wait_for("message", check=check, timeout=60)
         if msg.content.lower() != "skip":
-            if msg.role_mentions:
-                config["verified_role_id"] = msg.role_mentions[0].id
-                await ctx.send(f"✅ Verified role set to {msg.role_mentions[0].mention}")
-            else:
-                await ctx.send("⚠️ No role mentioned, skipping.")
-    except asyncio.TimeoutError:
-        await ctx.send("⏱️ Timeout, skipping...")
-    
-    # Announcement Channel
-    await ctx.send("📢 **Step 2:** Mention the announcement channel or type `skip`:")
-    try:
-        msg = await bot.wait_for("message", check=check, timeout=60)
-        if msg.content.lower() != "skip":
-            if msg.channel_mentions:
-                config["announcement_channel_id"] = msg.channel_mentions[0].id
-                await ctx.send(f"✅ Announcement channel set to {msg.channel_mentions[0].mention}")
-            else:
-                await ctx.send("⚠️ No channel mentioned, skipping.")
-    except asyncio.TimeoutError:
-        await ctx.send("⏱️ Timeout, skipping...")
-    
-    # Stats Channel
-    await ctx.send("📊 **Step 3:** Mention a voice channel for member count stats or type `skip`:")
-    try:
-        msg = await bot.wait_for("message", check=check, timeout=60)
-        if msg.content.lower() != "skip":
-            # Try to parse channel ID from message
             try:
-                channel_id = int(msg.content.strip().replace("<#", "").replace(">", ""))
-                channel = ctx.guild.get_channel(channel_id)
-                if channel and isinstance(channel, discord.VoiceChannel):
-                    config["stats_channel_id"] = channel_id
-                    await ctx.send(f"✅ Stats channel set to {channel.name}")
+                role_id = int(msg.content.strip())
+                role = ctx.guild.get_role(role_id)
+                if role:
+                    config["verified_role_id"] = role_id
+                    await ctx.send(f"✅ Verified role set to **{role.name}** (ID: `{role_id}`)")
                 else:
-                    await ctx.send("⚠️ Invalid voice channel, skipping.")
-            except:
-                await ctx.send("⚠️ Invalid channel ID, skipping.")
+                    await ctx.send(f"⚠️ No role found with ID `{role_id}` in this server. Skipping.")
+            except ValueError:
+                await ctx.send("⚠️ That doesn't look like a valid ID (numbers only). Skipping.")
     except asyncio.TimeoutError:
         await ctx.send("⏱️ Timeout, skipping...")
-    
+
+    # Step 2: Announcement Channel ID
+    await ctx.send("📢 **Step 2:** Paste the **Channel ID** for announcements, or type `skip`:")
+    try:
+        msg = await bot.wait_for("message", check=check, timeout=60)
+        if msg.content.lower() != "skip":
+            try:
+                channel_id = int(msg.content.strip())
+                channel = ctx.guild.get_channel(channel_id)
+                if channel:
+                    config["announcement_channel_id"] = channel_id
+                    await ctx.send(f"✅ Announcement channel set to **{channel.name}** (ID: `{channel_id}`)")
+                else:
+                    await ctx.send(f"⚠️ No channel found with ID `{channel_id}` in this server. Skipping.")
+            except ValueError:
+                await ctx.send("⚠️ That doesn't look like a valid ID (numbers only). Skipping.")
+    except asyncio.TimeoutError:
+        await ctx.send("⏱️ Timeout, skipping...")
+
+    # Step 3: Stats Channel ID
+    await ctx.send("📊 **Step 3:** Paste the **Channel ID** for member count stats, or type `skip`:")
+    try:
+        msg = await bot.wait_for("message", check=check, timeout=60)
+        if msg.content.lower() != "skip":
+            try:
+                channel_id = int(msg.content.strip())
+                channel = ctx.guild.get_channel(channel_id)
+                if channel:
+                    config["stats_channel_id"] = channel_id
+                    await ctx.send(f"✅ Stats channel set to **{channel.name}** (ID: `{channel_id}`)")
+                else:
+                    await ctx.send(f"⚠️ No channel found with ID `{channel_id}` in this server. Skipping.")
+            except ValueError:
+                await ctx.send("⚠️ That doesn't look like a valid ID (numbers only). Skipping.")
+    except asyncio.TimeoutError:
+        await ctx.send("⏱️ Timeout, skipping...")
+
     save_server_config(ctx.guild.id, config)
-    
+
+    # Final summary
     final_embed = discord.Embed(
         title="✅ Setup Complete!",
-        description="Your server has been configured.",
+        description="Your server has been configured successfully.",
         color=discord.Color.green()
     )
-    
-    if config:
-        final_embed.add_field(name="Configuration", value=json.dumps(config, indent=2), inline=False)
-    
+
+    configured_items = []
+    if config.get("verified_role_id"):
+        role = ctx.guild.get_role(config["verified_role_id"])
+        configured_items.append(f"🔐 Verified Role: **{role.name if role else 'Unknown'}** (`{config['verified_role_id']}`)")
+    if config.get("announcement_channel_id"):
+        ch = ctx.guild.get_channel(config["announcement_channel_id"])
+        configured_items.append(f"📢 Announcement Channel: **{ch.name if ch else 'Unknown'}** (`{config['announcement_channel_id']}`)")
+    if config.get("stats_channel_id"):
+        ch = ctx.guild.get_channel(config["stats_channel_id"])
+        configured_items.append(f"📊 Stats Channel: **{ch.name if ch else 'Unknown'}** (`{config['stats_channel_id']}`)")
+
+    if configured_items:
+        final_embed.add_field(name="Configured Settings", value="\n".join(configured_items), inline=False)
+    else:
+        final_embed.add_field(name="⚠️ Nothing Configured", value="All steps were skipped.", inline=False)
+
     await ctx.send(embed=final_embed)
 
 # -------------------------
