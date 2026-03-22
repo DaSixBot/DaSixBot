@@ -69,7 +69,6 @@ class AntiSpamSystem:
 # -------------------------
 # CHANNEL SILENT MODE SYSTEM
 # -------------------------
-# Configurable per server - admins can add channels
 SILENT_CHANNELS = {}
 
 async def setup_silent_channel(channel_id, guild):
@@ -129,10 +128,12 @@ anti_spam = AntiSpamSystem(
 # Global variables and constants
 PAYMENTS_FILE = "payments.json"
 CONFIG_FILE = "server_config.json"
+REMINDERS_FILE = "reminders.json"
 
-# Server-specific configuration
+# -------------------------
+# Config helpers
+# -------------------------
 def load_server_config(guild_id):
-    """Load server-specific configuration"""
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r") as f:
             all_configs = json.load(f)
@@ -140,57 +141,56 @@ def load_server_config(guild_id):
     return {}
 
 def save_server_config(guild_id, config):
-    """Save server-specific configuration"""
     all_configs = {}
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r") as f:
             all_configs = json.load(f)
-    
     all_configs[str(guild_id)] = config
-    
     with open(CONFIG_FILE, "w") as f:
         json.dump(all_configs, f, indent=4)
 
 def load_payments():
-    """Load payment data from JSON file"""
     if os.path.exists(PAYMENTS_FILE):
         with open(PAYMENTS_FILE, "r") as f:
             return json.load(f)
     return {}
 
 def save_payments(payments):
-    """Save payment data to JSON file"""
     with open(PAYMENTS_FILE, "w") as f:
         json.dump(payments, f, indent=4)
 
 def create_payment_embed(payments):
-    """Create an embed showing all payment balances"""
     embed = discord.Embed(
         title="💰 Payment Tracker",
         description="Current payment balances",
         color=discord.Color.green(),
         timestamp=datetime.now(timezone.utc)
     )
-    
     if not payments:
         embed.add_field(name="No Payments Yet", value="Use `!pay_add` to add payments", inline=False)
     else:
         sorted_payments = sorted(payments.items(), key=lambda x: x[1], reverse=True)
-        
         for username, amount in sorted_payments:
-            embed.add_field(
-                name=f"👤 {username}",
-                value=f"**${amount:,.2f}**",
-                inline=True
-            )
-    
+            embed.add_field(name=f"👤 {username}", value=f"**${amount:,.2f}**", inline=True)
     embed.set_footer(text="Last updated")
     return embed
+
+# -------------------------
+# REMINDERS HELPERS
+# -------------------------
+def load_reminders():
+    if os.path.exists(REMINDERS_FILE):
+        with open(REMINDERS_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+def save_reminders(reminders):
+    with open(REMINDERS_FILE, "w") as f:
+        json.dump(reminders, f, indent=4)
 
 # ---------------------------------
 # KeepAlive Task & Event Handlers
 # ---------------------------------
-
 @tasks.loop(minutes=30)
 async def keep_alive():
     print("[KeepAlive] Sending heartbeat ping to Discord...")
@@ -202,11 +202,9 @@ async def keep_alive():
 
 @tasks.loop(minutes=10)
 async def update_stats():
-    """Updates member count stats for all servers"""
     for guild in bot.guilds:
         config = load_server_config(guild.id)
         stats_channel_id = config.get("stats_channel_id")
-        
         if stats_channel_id:
             channel = guild.get_channel(stats_channel_id)
             if channel:
@@ -215,6 +213,31 @@ async def update_stats():
                     print(f"[Stats] Updated member count for {guild.name}: {guild.member_count}")
                 except Exception as e:
                     print(f"[Stats] Error updating channel in {guild.name}: {e}")
+
+@tasks.loop(seconds=30)
+async def reminder_loop():
+    """Check and fire due reminders every 30 seconds"""
+    reminders = load_reminders()
+    now = datetime.now(timezone.utc)
+    remaining = []
+    for reminder in reminders:
+        due_time = datetime.fromisoformat(reminder["due"])
+        if now >= due_time:
+            try:
+                user = await bot.fetch_user(reminder["user_id"])
+                embed = discord.Embed(
+                    title="⏰ Reminder!",
+                    description=reminder["message"],
+                    color=discord.Color.blurple(),
+                    timestamp=now
+                )
+                embed.set_footer(text="This reminder was set by you")
+                await user.send(embed=embed)
+            except Exception as e:
+                print(f"[Reminders] Could not send reminder to {reminder['user_id']}: {e}")
+        else:
+            remaining.append(reminder)
+    save_reminders(remaining)
 
 @bot.event
 async def on_disconnect():
@@ -229,11 +252,9 @@ async def on_ready():
     await bot.change_presence(activity=discord.Game(name="!help | Multi-Server Bot"))
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     print(f"Connected to {len(bot.guilds)} servers")
-    
-    # Start tasks
     keep_alive.start()
     update_stats.start()
-    
+    reminder_loop.start()
     print("[Bot] All background tasks started")
 
 # -------------------------
@@ -241,26 +262,20 @@ async def on_ready():
 # -------------------------
 @bot.event
 async def on_message(message):
-    """Handle messages for spam detection and silent channels"""
-    
-    # Ignore bot messages
     if message.author.bot:
         await bot.process_commands(message)
         return
-    
-    # Skip DMs
     if not message.guild:
         await bot.process_commands(message)
         return
-    
+
     user_id = message.author.id
-    
-    # Check if user is spamming
+
     if anti_spam.is_user_muted(user_id):
         try:
             await message.delete()
             remaining = anti_spam.get_mute_remaining(user_id)
-            warning = await message.channel.send(
+            await message.channel.send(
                 f"⏱️ {message.author.mention}, you're currently muted for spam. "
                 f"You can send messages again in {int(remaining)} seconds.",
                 delete_after=10
@@ -268,33 +283,28 @@ async def on_message(message):
         except discord.Forbidden:
             print(f"[AntiSpam] Could not delete message from {message.author}")
         return
-    
-    # Check for spam
+
     if anti_spam.add_message(user_id):
         anti_spam.mute_user(user_id)
-        
         print(f"[AntiSpam] {message.author} ({message.author.id}) detected as spammer in #{message.channel.name}")
-        
         try:
             await message.delete()
         except discord.Forbidden:
-            print(f"[AntiSpam] Could not delete spam message from {message.author}")
-        
+            pass
         try:
             embed = discord.Embed(
                 title="⚠️ Spam Detected",
                 description=(
-                    f"You've been temporarily muted for spamming.\n\n"
-                    f"**Reason:** Sending too many messages too quickly\n"
-                    f"**Duration:** 5 minutes\n\n"
-                    f"Please slow down and follow server rules."
+                    "You've been temporarily muted for spamming.\n\n"
+                    "**Reason:** Sending too many messages too quickly\n"
+                    "**Duration:** 5 minutes\n\n"
+                    "Please slow down and follow server rules."
                 ),
                 color=discord.Color.red()
             )
             await message.author.send(embed=embed)
         except discord.Forbidden:
-            print(f"[AntiSpam] Could not DM {message.author}")
-        
+            pass
         mod_role = discord.utils.get(message.guild.roles, name="Moderator")
         if mod_role:
             try:
@@ -311,75 +321,56 @@ async def on_message(message):
                 await message.channel.send(embed=embed, delete_after=30)
             except Exception as e:
                 print(f"[AntiSpam] Could not notify mods: {e}")
-        
         return
-    
-    # Handle silent channels
+
     if message.channel.id in SILENT_CHANNELS:
         is_admin = message.author.guild_permissions.administrator
-        
-        # If admin sends a message with @everyone, let it through
         if is_admin and message.guild.default_role in message.mentions:
             await bot.process_commands(message)
             return
-        
-        # If admin sends ANY message, add @everyone to trigger notifications
         if is_admin and message.guild.default_role not in message.mentions:
             try:
                 await message.edit(content=f"@everyone {message.content}")
             except discord.Forbidden:
-                print(f"[SilentMode] Could not edit admin message in {message.channel.name}")
+                pass
             await bot.process_commands(message)
             return
-        
-        # Non-admin users: remove any @everyone/@here attempts
         if message.guild.default_role in message.mentions or "@here" in message.content:
             try:
-                content = message.content
-                content = content.replace("@everyone", "")
-                content = content.replace("@here", "")
+                content = message.content.replace("@everyone", "").replace("@here", "")
                 await message.edit(content=content)
-                
                 try:
                     dm_embed = discord.Embed(
                         title="🔕 Notification Silenced",
-                        description=f"Your message in {message.channel.mention} cannot ping @everyone.\n\nOnly admins can use @everyone in this channel to trigger notifications.",
+                        description=f"Your message in {message.channel.mention} cannot ping @everyone.\n\nOnly admins can use @everyone in this channel.",
                         color=discord.Color.orange()
                     )
                     await message.author.send(embed=dm_embed)
                 except discord.Forbidden:
                     pass
             except discord.Forbidden:
-                print(f"[SilentMode] Could not edit message in {message.channel.name}")
-            
+                pass
             await bot.process_commands(message)
             return
-    
-    # Handle verification codes (if in pending verifications)
+
     if message.author.id in PENDING_VERIFICATIONS:
         verification = PENDING_VERIFICATIONS[message.author.id]
-        
         if message.channel.id == verification.get("channel_id"):
             code_input = message.content.strip()
-            
             if len(code_input) == 6 and code_input.isdigit():
                 try:
                     await message.delete()
                 except discord.Forbidden:
                     pass
-                
                 if code_input == verification["code"]:
                     config = load_server_config(message.guild.id)
                     verified_role_id = config.get("verified_role_id")
-                    
                     if verified_role_id:
                         verified_role = message.guild.get_role(verified_role_id)
                         if verified_role:
                             await message.author.add_roles(verified_role)
-                            
                             verification_data = load_verifications()
                             account_analysis = check_account_age(message.author)
-                            
                             verification_data[str(message.author.id)] = {
                                 "verified_at": datetime.now(timezone.utc).isoformat(),
                                 "account_age_days": account_analysis["account_age_days"],
@@ -388,9 +379,7 @@ async def on_message(message):
                                 "method": "channel_code"
                             }
                             save_verifications(verification_data)
-                            
                             del PENDING_VERIFICATIONS[message.author.id]
-                            
                             success_msg = await message.channel.send(
                                 f"✅ **{message.author.mention} Verification successful!** You now have access to the server."
                             )
@@ -399,7 +388,6 @@ async def on_message(message):
                                 await success_msg.delete()
                             except:
                                 pass
-                            
                             try:
                                 welcome_embed = discord.Embed(
                                     title="✅ You're Now Verified!",
@@ -416,7 +404,6 @@ async def on_message(message):
                                 pass
                 else:
                     verification["attempts"] += 1
-                    
                     if verification["attempts"] >= 3:
                         error_msg = await message.channel.send(
                             f"❌ **{message.author.mention}** Too many failed attempts. Please wait 5 minutes before requesting a new code."
@@ -426,49 +413,40 @@ async def on_message(message):
                         error_msg = await message.channel.send(
                             f"❌ **{message.author.mention}** Incorrect code! Attempts remaining: {3 - verification['attempts']}"
                         )
-                    
                     await asyncio.sleep(5)
                     try:
                         await error_msg.delete()
                     except:
                         pass
-    
-    # Process normal commands
+
     await bot.process_commands(message)
 
-        
+
 # -------------------------
 # Advanced Support Ticket System
 # -------------------------
-
 TICKET_DATA_FILE = "tickets.json"
 
 def load_ticket_data():
-    """Load ticket data from JSON"""
     if os.path.exists(TICKET_DATA_FILE):
         with open(TICKET_DATA_FILE, "r") as f:
             return json.load(f)
     return {}
 
 def save_ticket_data(data):
-    """Save ticket data to JSON"""
     with open(TICKET_DATA_FILE, "w") as f:
         json.dump(data, f, indent=4)
 
 def get_next_ticket_number(guild_id):
-    """Get next ticket number for the guild"""
     ticket_data = load_ticket_data()
     guild_str = str(guild_id)
-    
     if guild_str not in ticket_data:
         ticket_data[guild_str] = {"counter": 0, "tickets": {}}
-    
     ticket_data[guild_str]["counter"] += 1
     save_ticket_data(ticket_data)
     return ticket_data[guild_str]["counter"]
 
 async def generate_transcript(channel):
-    """Generates a detailed HTML transcript of the channel history"""
     html_template = """
     <!DOCTYPE html>
     <html>
@@ -476,47 +454,14 @@ async def generate_transcript(channel):
         <meta charset="UTF-8">
         <title>Ticket Transcript - {channel_name}</title>
         <style>
-            body {{
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                background: #36393f;
-                color: #dcddde;
-                margin: 20px;
-            }}
-            .header {{
-                background: #202225;
-                padding: 20px;
-                border-radius: 8px;
-                margin-bottom: 20px;
-            }}
-            .message {{
-                background: #40444b;
-                padding: 15px;
-                margin: 10px 0;
-                border-radius: 8px;
-                border-left: 4px solid #7289da;
-            }}
-            .author {{
-                color: #7289da;
-                font-weight: bold;
-            }}
-            .timestamp {{
-                color: #72767d;
-                font-size: 12px;
-            }}
-            .content {{
-                margin-top: 8px;
-                line-height: 1.5;
-            }}
-            .attachment {{
-                color: #00b0f4;
-                text-decoration: none;
-                display: block;
-                margin-top: 5px;
-            }}
-            .system {{
-                background: #2f3136;
-                border-left: 4px solid #faa61a;
-            }}
+            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #36393f; color: #dcddde; margin: 20px; }}
+            .header {{ background: #202225; padding: 20px; border-radius: 8px; margin-bottom: 20px; }}
+            .message {{ background: #40444b; padding: 15px; margin: 10px 0; border-radius: 8px; border-left: 4px solid #7289da; }}
+            .author {{ color: #7289da; font-weight: bold; }}
+            .timestamp {{ color: #72767d; font-size: 12px; }}
+            .content {{ margin-top: 8px; line-height: 1.5; }}
+            .attachment {{ color: #00b0f4; text-decoration: none; display: block; margin-top: 5px; }}
+            .system {{ background: #2f3136; border-left: 4px solid #faa61a; }}
         </style>
     </head>
     <body>
@@ -525,25 +470,19 @@ async def generate_transcript(channel):
             <p>Generated at: {timestamp}</p>
             <p>Total Messages: {message_count}</p>
         </div>
-        <div class="messages">
-        {messages}
-        </div>
+        <div class="messages">{messages}</div>
     </body>
     </html>
     """
-    
     messages = [message async for message in channel.history(limit=None, oldest_first=True)]
-    
     message_html = ""
     for msg in messages:
         timestamp = msg.created_at.strftime('%Y-%m-%d %H:%M:%S')
         message_class = "message system" if msg.author.bot else "message"
-        
         attachments_html = ""
         if msg.attachments:
             for att in msg.attachments:
                 attachments_html += f'<a class="attachment" href="{att.url}">📎 {att.filename}</a>'
-        
         message_html += f"""
         <div class="{message_class}">
             <span class="author">{msg.author.name}</span>
@@ -552,15 +491,64 @@ async def generate_transcript(channel):
             {attachments_html}
         </div>
         """
-    
     html_content = html_template.format(
         channel_name=channel.name,
         timestamp=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
         message_count=len(messages),
         messages=message_html
     )
-    
     return io.BytesIO(html_content.encode('utf-8'))
+
+
+# -------------------------
+# TICKET RATING SYSTEM
+# -------------------------
+class TicketRatingView(View):
+    """Sent via DM after a ticket closes — 1 to 5 star rating"""
+    def __init__(self, ticket_number, guild_name):
+        super().__init__(timeout=86400)  # 24 hour window to rate
+        self.ticket_number = ticket_number
+        self.guild_name = guild_name
+
+    async def _record_rating(self, interaction: discord.Interaction, stars: int, label: str):
+        ticket_data = load_ticket_data()
+        for guild_str, guild_data in ticket_data.items():
+            ticket_key = f"ticket-{self.ticket_number}"
+            if ticket_key in guild_data.get("tickets", {}):
+                guild_data["tickets"][ticket_key]["rating"] = stars
+                guild_data["tickets"][ticket_key]["rated_at"] = datetime.now(timezone.utc).isoformat()
+                save_ticket_data(ticket_data)
+                break
+
+        embed = discord.Embed(
+            title="⭐ Thanks for your feedback!",
+            description=f"You rated your support experience **{label}** for ticket **#{self.ticket_number}** in **{self.guild_name}**.\n\nYour feedback helps us improve!",
+            color=discord.Color.gold()
+        )
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="⭐", style=discord.ButtonStyle.secondary, custom_id="rate_1")
+    async def rate_1(self, interaction: discord.Interaction, button: Button):
+        await self._record_rating(interaction, 1, "⭐ (1/5)")
+
+    @discord.ui.button(label="⭐⭐", style=discord.ButtonStyle.secondary, custom_id="rate_2")
+    async def rate_2(self, interaction: discord.Interaction, button: Button):
+        await self._record_rating(interaction, 2, "⭐⭐ (2/5)")
+
+    @discord.ui.button(label="⭐⭐⭐", style=discord.ButtonStyle.secondary, custom_id="rate_3")
+    async def rate_3(self, interaction: discord.Interaction, button: Button):
+        await self._record_rating(interaction, 3, "⭐⭐⭐ (3/5)")
+
+    @discord.ui.button(label="⭐⭐⭐⭐", style=discord.ButtonStyle.secondary, custom_id="rate_4")
+    async def rate_4(self, interaction: discord.Interaction, button: Button):
+        await self._record_rating(interaction, 4, "⭐⭐⭐⭐ (4/5)")
+
+    @discord.ui.button(label="⭐⭐⭐⭐⭐", style=discord.ButtonStyle.success, custom_id="rate_5")
+    async def rate_5(self, interaction: discord.Interaction, button: Button):
+        await self._record_rating(interaction, 5, "⭐⭐⭐⭐⭐ (5/5)")
+
 
 class TicketCategorySelect(Select):
     def __init__(self):
@@ -579,10 +567,11 @@ class TicketCategorySelect(Select):
             options=options,
             custom_id="ticket_category_select"
         )
-    
+
     async def callback(self, interaction: discord.Interaction):
         selected_category = self.values[0]
         await interaction.response.send_modal(ReportModal(selected_category))
+
 
 class TicketControlsView(View):
     def __init__(self, ticket_number):
@@ -593,30 +582,22 @@ class TicketControlsView(View):
     async def claim_callback(self, interaction: discord.Interaction, button: Button):
         if not interaction.user.guild_permissions.manage_messages:
             return await interaction.response.send_message("❌ Only staff can claim tickets.", ephemeral=True)
-
         embed = interaction.message.embeds[0]
-        
         for field in embed.fields:
             if field.name == "👨‍💻 Claimed By":
                 return await interaction.response.send_message("❌ This ticket is already claimed!", ephemeral=True)
-        
         embed.color = discord.Color.gold()
         embed.add_field(name="👨‍💻 Claimed By", value=interaction.user.mention, inline=True)
         embed.add_field(name="⏰ Claimed At", value=f"<t:{int(datetime.now(timezone.utc).timestamp())}:R>", inline=True)
-        
         for i, field in enumerate(embed.fields):
             if field.name == "📝 Status":
                 embed.set_field_at(i, name="📝 Status", value="🟡 Claimed", inline=True)
-        
         embed.set_footer(text=f"Ticket #{self.ticket_number} | Status: CLAIMED")
-        
         button.disabled = True
         button.label = "✅ Claimed"
         button.style = discord.ButtonStyle.success
-        
         await interaction.message.edit(embed=embed, view=self)
         await interaction.response.send_message(f"✅ {interaction.user.mention} has claimed this ticket!", ephemeral=False)
-        
         ticket_data = load_ticket_data()
         guild_str = str(interaction.guild.id)
         ticket_str = f"ticket-{self.ticket_number}"
@@ -632,12 +613,24 @@ class TicketControlsView(View):
                 return await interaction.response.send_message("❌ Only staff or the ticket owner can close this.", ephemeral=True)
 
         await interaction.response.send_message("🔒 Generating transcript and closing ticket...", ephemeral=True)
-        
+
         html_transcript = await generate_transcript(interaction.channel)
-        
         ticket_number = interaction.channel.name.split("-")[-1]
         user_id = interaction.channel.topic.split("ID: ")[-1] if interaction.channel.topic else "Unknown"
-        
+
+        # Record close time for stats
+        ticket_data = load_ticket_data()
+        guild_str = str(interaction.guild.id)
+        ticket_str = f"ticket-{ticket_number}"
+        closed_at_iso = datetime.now(timezone.utc).isoformat()
+
+        if guild_str in ticket_data and ticket_str in ticket_data[guild_str].get("tickets", {}):
+            tkt = ticket_data[guild_str]["tickets"][ticket_str]
+            tkt["closed_by"] = str(interaction.user.id)
+            tkt["closed_at"] = closed_at_iso
+            tkt["status"] = "closed"
+            save_ticket_data(ticket_data)
+
         close_embed = discord.Embed(
             title="🔒 Ticket Closed",
             description=f"**Ticket #{ticket_number}** has been closed.",
@@ -646,7 +639,7 @@ class TicketControlsView(View):
         )
         close_embed.add_field(name="Closed By", value=interaction.user.mention, inline=True)
         close_embed.add_field(name="Channel", value=interaction.channel.name, inline=True)
-        
+
         mod_log_channel = discord.utils.get(interaction.guild.channels, name="ticket-logs")
         if mod_log_channel:
             html_transcript.seek(0)
@@ -654,7 +647,8 @@ class TicketControlsView(View):
                 embed=close_embed,
                 file=discord.File(html_transcript, filename=f"ticket-{ticket_number}-transcript.html")
             )
-        
+
+        # DM user transcript + rating request
         try:
             member = interaction.guild.get_member(int(user_id))
             if member:
@@ -668,17 +662,20 @@ class TicketControlsView(View):
                     embed=dm_embed,
                     file=discord.File(html_transcript, filename=f"ticket-{ticket_number}-transcript.html")
                 )
-        except:
-            pass
 
-        ticket_data = load_ticket_data()
-        guild_str = str(interaction.guild.id)
-        ticket_str = f"ticket-{ticket_number}"
-        if guild_str in ticket_data and ticket_str in ticket_data[guild_str].get("tickets", {}):
-            ticket_data[guild_str]["tickets"][ticket_str]["closed_by"] = str(interaction.user.id)
-            ticket_data[guild_str]["tickets"][ticket_str]["closed_at"] = datetime.now(timezone.utc).isoformat()
-            ticket_data[guild_str]["tickets"][ticket_str]["status"] = "closed"
-            save_ticket_data(ticket_data)
+                # Send rating request
+                rating_embed = discord.Embed(
+                    title="⭐ How was your support experience?",
+                    description=(
+                        f"Please rate your experience for ticket **#{ticket_number}** in **{interaction.guild.name}**.\n\n"
+                        "Your feedback helps us improve our support quality!"
+                    ),
+                    color=discord.Color.gold()
+                )
+                rating_view = TicketRatingView(ticket_number, interaction.guild.name)
+                await member.send(embed=rating_embed, view=rating_view)
+        except Exception as e:
+            print(f"[Ticket] Could not DM user after close: {e}")
 
         await asyncio.sleep(3)
         await interaction.channel.delete()
@@ -687,36 +684,28 @@ class TicketControlsView(View):
     async def add_user_callback(self, interaction: discord.Interaction, button: Button):
         if not interaction.user.guild_permissions.manage_messages:
             return await interaction.response.send_message("❌ Only staff can add users.", ephemeral=True)
-        
         await interaction.response.send_modal(AddUserModal(interaction.channel))
 
     @discord.ui.button(label="⚠️ Priority", style=discord.ButtonStyle.secondary, custom_id="priority_ticket")
     async def priority_callback(self, interaction: discord.Interaction, button: Button):
         if not interaction.user.guild_permissions.manage_messages:
             return await interaction.response.send_message("❌ Only staff can change priority.", ephemeral=True)
-        
         view = PrioritySelectView(interaction.message, self.ticket_number)
         await interaction.response.send_message("Select new priority level:", view=view, ephemeral=True)
+
 
 class AddUserModal(Modal):
     def __init__(self, channel):
         super().__init__(title="Add User to Ticket")
         self.channel = channel
-        
-        self.user_input = TextInput(
-            label="User ID or @mention",
-            placeholder="Enter user ID or mention them",
-            style=discord.TextStyle.short
-        )
+        self.user_input = TextInput(label="User ID or @mention", placeholder="Enter user ID or mention them", style=discord.TextStyle.short)
         self.add_item(self.user_input)
-    
+
     async def on_submit(self, interaction: discord.Interaction):
         user_input = self.user_input.value.strip().replace("<@", "").replace(">", "").replace("!", "")
-        
         try:
             user_id = int(user_input)
             member = interaction.guild.get_member(user_id)
-            
             if member:
                 await self.channel.set_permissions(member, read_messages=True, send_messages=True)
                 await interaction.response.send_message(f"✅ Added {member.mention} to the ticket.", ephemeral=True)
@@ -726,70 +715,49 @@ class AddUserModal(Modal):
         except ValueError:
             await interaction.response.send_message("❌ Invalid user ID or mention.", ephemeral=True)
 
+
 class PrioritySelectView(View):
     def __init__(self, message, ticket_number):
         super().__init__(timeout=60)
         self.message = message
         self.ticket_number = ticket_number
-        
         options = [
             discord.SelectOption(label="🟢 Low Priority", value="low", emoji="🟢"),
             discord.SelectOption(label="🟡 Medium Priority", value="medium", emoji="🟡"),
             discord.SelectOption(label="🟠 High Priority", value="high", emoji="🟠"),
             discord.SelectOption(label="🔴 Critical Priority", value="critical", emoji="🔴"),
         ]
-        
         select = Select(placeholder="Choose priority level", options=options)
         select.callback = self.select_callback
         self.add_item(select)
-    
+
     async def select_callback(self, interaction: discord.Interaction):
         priority = interaction.data["values"][0]
-        
         embed = self.message.embeds[0]
-        
-        priority_display = {
-            "low": "🟢 Low",
-            "medium": "🟡 Medium",
-            "high": "🟠 High",
-            "critical": "🔴 Critical"
-        }
-        
+        priority_display = {"low": "🟢 Low", "medium": "🟡 Medium", "high": "🟠 High", "critical": "🔴 Critical"}
         for i, field in enumerate(embed.fields):
             if field.name == "⚡ Priority":
                 embed.set_field_at(i, name="⚡ Priority", value=priority_display[priority], inline=True)
-        
         await self.message.edit(embed=embed)
         await interaction.response.send_message(f"✅ Priority updated to **{priority_display[priority]}**", ephemeral=True)
-        
         await interaction.channel.send(f"⚠️ Ticket priority changed to **{priority_display[priority]}** by {interaction.user.mention}")
+
 
 class ReportModal(Modal):
     def __init__(self, category):
         super().__init__(title=f"🎫 Create Ticket - {category}")
         self.category = category
-        
-        self.issue_title = TextInput(
-            label="Title",
-            placeholder="Brief summary of your issue",
-            max_length=100,
-            style=discord.TextStyle.short
-        )
-        
+        self.issue_title = TextInput(label="Title", placeholder="Brief summary of your issue", max_length=100, style=discord.TextStyle.short)
         self.issue_details = TextInput(
-            label="Details",
-            style=discord.TextStyle.paragraph,
+            label="Details", style=discord.TextStyle.paragraph,
             placeholder="Please describe your issue in detail. Include any relevant information, screenshots, or links.",
-            min_length=20,
-            max_length=1000
+            min_length=20, max_length=1000
         )
-        
         self.add_item(self.issue_title)
         self.add_item(self.issue_details)
 
     async def on_submit(self, interaction: discord.Interaction):
         guild = interaction.guild
-        
         existing_tickets = [ch for ch in guild.text_channels if f"ticket-{interaction.user.name.lower()}" in ch.name.lower()]
         for ticket in existing_tickets:
             if ticket.topic and str(interaction.user.id) in ticket.topic:
@@ -797,7 +765,6 @@ class ReportModal(Modal):
                 return
 
         ticket_number = get_next_ticket_number(guild.id)
-        
         category = discord.utils.get(guild.categories, name="📬 Support Tickets")
         if not category:
             category = await guild.create_category("📬 Support Tickets")
@@ -807,7 +774,6 @@ class ReportModal(Modal):
             interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True),
             guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True, manage_messages=True)
         }
-        
         mod_role = discord.utils.get(guild.roles, name="Moderator")
         if mod_role:
             overwrites[mod_role] = discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_messages=True)
@@ -825,36 +791,29 @@ class ReportModal(Modal):
             color=discord.Color.blue(),
             timestamp=datetime.now(timezone.utc)
         )
-        
         embed.add_field(name="⚡ Priority", value="🟡 Medium", inline=True)
         embed.add_field(name="📝 Status", value="🔵 Open", inline=True)
         embed.add_field(name="🎫 Ticket Number", value=f"#{ticket_number}", inline=True)
         embed.add_field(name="📋 Issue Details", value=f"```\n{self.issue_details.value[:500]}\n```", inline=False)
-        
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
         embed.set_footer(text=f"Ticket #{ticket_number} | Created")
 
         view = TicketControlsView(ticket_number)
-        
-        welcome_msg = f"""
-{interaction.user.mention} Welcome to your support ticket!
-
-**What to expect:**
-• A staff member will be with you shortly
-• Please provide any additional details or screenshots
-• Do not ping staff members
-• Be patient and respectful
-
-**Need urgent help?** @ mention a moderator if this is critical.
-        """
-
+        welcome_msg = (
+            f"{interaction.user.mention} Welcome to your support ticket!\n\n"
+            "**What to expect:**\n"
+            "• A staff member will be with you shortly\n"
+            "• Please provide any additional details or screenshots\n"
+            "• Do not ping staff members\n"
+            "• Be patient and respectful\n\n"
+            "**Need urgent help?** @ mention a moderator if this is critical."
+        )
         await ticket_channel.send(content=welcome_msg, embed=embed, view=view)
-        
+
         ticket_data = load_ticket_data()
         guild_str = str(guild.id)
         if guild_str not in ticket_data:
             ticket_data[guild_str] = {"counter": ticket_number, "tickets": {}}
-        
         ticket_data[guild_str]["tickets"][f"ticket-{ticket_number}"] = {
             "user_id": str(interaction.user.id),
             "category": self.category,
@@ -864,22 +823,23 @@ class ReportModal(Modal):
             "priority": "medium"
         }
         save_ticket_data(ticket_data)
-        
+
         await interaction.response.send_message(f"✅ Ticket **#{ticket_number}** created: {ticket_channel.mention}", ephemeral=True)
-        
         if any(word in self.category.lower() for word in ["report", "critical"]):
             if mod_role:
                 await ticket_channel.send(f"{mod_role.mention} 🚨 New {self.category} ticket requires attention!")
+
 
 class TicketCategoryView(View):
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(TicketCategorySelect())
 
+
 class ReportView(View):
     def __init__(self):
         super().__init__(timeout=None)
-        
+
     @discord.ui.button(label="📨 Create Ticket", style=discord.ButtonStyle.blurple, emoji="🎫", custom_id="create_ticket_btn")
     async def create_ticket(self, interaction: discord.Interaction, button: Button):
         view = TicketCategoryView()
@@ -890,12 +850,12 @@ class ReportView(View):
         )
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
+
 # -------------------------
 # Server Rules Command
 # -------------------------
 @bot.command(name="rules")
 async def rules(ctx):
-    """Display server rules"""
     rules_text = (
         "1️⃣ **Respect Everyone**\n"
         "Be kind and respectful to all members. Harassment, hate speech, discrimination, or bullying will not be tolerated.\n\n"
@@ -913,7 +873,7 @@ async def rules(ctx):
         "Stick to the topic of each channel. Off-topic discussions should go to general chat.\n\n"
         "8️⃣ **Listen to Staff**\n"
         "Moderators and admins have the final say. If you have concerns, message them privately.\n\n"
-        "🚨 Breaking any of these rules may result in warnings, mutes, kicks, or bans. Let's keep the server a fun and friendly place!\n\n"
+        "🚨 Breaking any of these rules may result in warnings, mutes, kicks, or bans.\n"
     )
     embed = discord.Embed(
         title="📋 Server Rules",
@@ -924,52 +884,43 @@ async def rules(ctx):
     embed.set_footer(text="Please follow the rules to keep our community safe and friendly!")
     await ctx.send(embed=embed)
 
+
 # -------------------------
 # ADVANCED VERIFICATION SYSTEM
 # -------------------------
-
 VERIFICATION_FILE = "verifications.json"
 PENDING_VERIFICATIONS = {}
 
 def load_verifications():
-    """Load verification data"""
     if os.path.exists(VERIFICATION_FILE):
         with open(VERIFICATION_FILE, "r") as f:
             return json.load(f)
     return {}
 
 def save_verifications(data):
-    """Save verification data"""
     with open(VERIFICATION_FILE, "w") as f:
         json.dump(data, f, indent=4)
 
 def generate_verification_code():
-    """Generate a random 6-digit verification code"""
     return ''.join(random.choices('0123456789', k=6))
 
 def check_account_age(member):
-    """Check if account meets age requirements"""
     now = datetime.now(timezone.utc)
     account_age_days = (now - member.created_at).days
-    
     flags = []
     risk_level = "low"
-    
     if account_age_days < 7:
         flags.append("⚠️ Account is less than 7 days old")
         risk_level = "high"
     elif account_age_days < 30:
         flags.append("⚠️ Account is less than 30 days old")
         risk_level = "medium"
-    
     if member.avatar is None:
         flags.append("⚠️ Using default Discord avatar")
         if risk_level == "low":
             risk_level = "medium"
-    
     if not member.display_name or member.display_name == member.name:
         flags.append("ℹ️ No custom display name set")
-    
     return {
         "account_age_days": account_age_days,
         "risk_level": risk_level,
@@ -977,32 +928,26 @@ def check_account_age(member):
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
+
 class VerifyButton(View):
     def __init__(self):
         super().__init__(timeout=None)
-    
+
     @discord.ui.button(label="🔐 Verify", style=discord.ButtonStyle.success, custom_id="verify_button_main")
     async def verify_button(self, interaction: discord.Interaction, button: Button):
         config = load_server_config(interaction.guild.id)
         verified_role_id = config.get("verified_role_id")
-        
         if not verified_role_id:
-            return await interaction.response.send_message("❌ Verification is not set up for this server. Please contact an administrator.", ephemeral=True)
-        
+            return await interaction.response.send_message("❌ Verification is not set up for this server.", ephemeral=True)
         verified_role = interaction.guild.get_role(verified_role_id)
         if verified_role in interaction.user.roles:
             await interaction.response.send_message("✅ You are already verified!", ephemeral=True)
             return
-        
         if interaction.user.id in PENDING_VERIFICATIONS:
             time_since = datetime.now(timezone.utc) - PENDING_VERIFICATIONS[interaction.user.id]["timestamp"]
             if time_since.total_seconds() < 300:
-                await interaction.response.send_message(
-                    "⏳ You already have a pending verification. Please check your DMs for the code or type it in this channel.",
-                    ephemeral=True
-                )
+                await interaction.response.send_message("⏳ You already have a pending verification. Check your DMs.", ephemeral=True)
                 return
-        
         code = generate_verification_code()
         PENDING_VERIFICATIONS[interaction.user.id] = {
             "code": code,
@@ -1010,77 +955,45 @@ class VerifyButton(View):
             "attempts": 0,
             "channel_id": interaction.channel.id
         }
-        
         try:
             dm_embed = discord.Embed(
                 title="🔐 Server Verification Required",
                 description=(
                     f"Welcome to **{interaction.guild.name}**!\n\n"
-                    "To verify your account and gain access to the server, please follow these steps:\n\n"
-                    "**Step 1:** Read the server rules in the verification channel\n"
+                    "**Step 1:** Read the server rules\n"
                     "**Step 2:** Copy your verification code below\n"
-                    "**Step 3:** Type your code in the verification channel\n"
-                    "**Step 4:** Your message will be automatically deleted for security\n\n"
+                    "**Step 3:** Type it in the verification channel\n"
                 ),
                 color=discord.Color.blue(),
                 timestamp=datetime.now(timezone.utc)
             )
-            
-            dm_embed.add_field(
-                name="🔑 Your Verification Code",
-                value=f"```\n{code}\n```",
-                inline=False
-            )
-            
-            dm_embed.add_field(
-                name="⚠️ Important",
-                value="• This code expires in 15 minutes\n• Do not share this code with anyone\n• Type it in the verification channel, it will be deleted automatically\n• If you didn't request this, ignore this message",
-                inline=False
-            )
-            
+            dm_embed.add_field(name="🔑 Your Verification Code", value=f"```\n{code}\n```", inline=False)
+            dm_embed.add_field(name="⚠️ Important", value="• Expires in 15 minutes\n• Do not share this code\n• Type it in the verification channel", inline=False)
             dm_embed.set_footer(text=f"Verification for {interaction.guild.name}")
-            
             await interaction.user.send(embed=dm_embed)
-            await interaction.response.send_message(
-                "✅ **Verification code sent to your DMs!**\n\nType the code in this channel and it will be automatically deleted for security.",
-                ephemeral=True
-            )
-            
+            await interaction.response.send_message("✅ **Verification code sent to your DMs!**\n\nType the code in this channel.", ephemeral=True)
         except discord.Forbidden:
             await interaction.response.send_message(
-                f"⚠️ **Unable to send you a DM!**\n\n"
-                f"**Your verification code is:** `{code}`\n\n"
-                f"**Next steps:**\n"
-                f"1. Copy the code above\n"
-                f"2. Type it in this channel\n"
-                f"3. Your message will be automatically deleted\n\n"
-                f"**Note:** This code expires in 15 minutes.",
+                f"⚠️ **Unable to DM you!**\n\n**Your code:** `{code}`\n\nType it in this channel. Expires in 15 minutes.",
                 ephemeral=True
             )
+
 
 @bot.command(name="verify")
 @commands.has_permissions(administrator=True)
 async def verify(ctx: commands.Context, member: discord.Member = None):
-    """Manually verify a member"""
     if member is None:
         member = ctx.author
-    
     config = load_server_config(ctx.guild.id)
     verified_role_id = config.get("verified_role_id")
-    
     if not verified_role_id:
         return await ctx.send("❌ Verified role not set. Use `!setup` to configure.")
-    
     verified_role = ctx.guild.get_role(verified_role_id)
     if verified_role is None:
-        await ctx.send("❌ Verified role not found. Please check the role ID.")
-        return
-    
+        return await ctx.send("❌ Verified role not found.")
     await member.add_roles(verified_role)
-    
     verification_data = load_verifications()
     account_analysis = check_account_age(member)
-    
     verification_data[str(member.id)] = {
         "verified_at": datetime.now(timezone.utc).isoformat(),
         "verified_by": str(ctx.author.id),
@@ -1089,9 +1002,7 @@ async def verify(ctx: commands.Context, member: discord.Member = None):
         "guild_id": str(ctx.guild.id)
     }
     save_verifications(verification_data)
-    
     await ctx.send(f"✅ {member.mention} has been manually verified!")
-    
     try:
         embed = discord.Embed(
             title="✅ You've Been Verified!",
@@ -1102,120 +1013,80 @@ async def verify(ctx: commands.Context, member: discord.Member = None):
     except discord.Forbidden:
         pass
 
+
 @bot.command(name="sendverify")
 @commands.has_permissions(administrator=True)
 async def sendverify(ctx):
-    """Send the verification embed with button"""
     embed = discord.Embed(
         title="🔐 Server Verification",
         description=(
             "Welcome! To access this server, you must verify your account.\n\n"
-            "**Why verify?**\n"
-            "• Prevents spam and raids\n"
-            "• Protects against bots\n"
-            "• Keeps the community safe\n\n"
             "**How to verify:**\n"
             "1. Click the **Verify** button below\n"
             "2. Check your DMs for a verification code\n"
             "3. Type the code in this channel (it will be auto-deleted)\n"
             "4. Get instant access to the server!\n\n"
-            "**Can't receive DMs?**\n"
-            "No problem! The code will be shown to you privately when you click verify.\n\n"
-            "**Need help?**\n"
-            "Contact a moderator for assistance."
+            "**Can't receive DMs?** The code will be shown to you privately."
         ),
         color=discord.Color.blue()
     )
-    
     embed.set_footer(text="Click the button below to start verification")
-    
     view = VerifyButton()
     await ctx.send(embed=embed, view=view)
 
+
 @bot.event
 async def on_member_join(member):
-    """Send verification instructions when a new member joins"""
     await asyncio.sleep(2)
-    
     config = load_server_config(member.guild.id)
     if not config.get("verified_role_id"):
         return
-    
     try:
         account_analysis = check_account_age(member)
-        
         embed = discord.Embed(
             title=f"👋 Welcome to {member.guild.name}!",
             description=(
                 f"Hey {member.mention}! Welcome to the server!\n\n"
                 "**To get started:**\n"
-                "Go to the verification channel and click the **Verify** button.\n"
-                "You'll receive a code to complete verification.\n\n"
+                "Go to the verification channel and click the **Verify** button.\n\n"
                 "See you inside! 🎉"
             ),
             color=discord.Color.blue()
         )
-        
         embed.set_footer(text=f"Account created {account_analysis['account_age_days']} days ago")
-        
         await member.send(embed=embed)
-        
     except discord.Forbidden:
-        print(f"Could not DM {member.display_name} - DMs are closed")
-            
+        pass
+
+
 # -------------------------
 # Payment Tracking Commands
 # -------------------------
-async def update_payment_embed(ctx, channel_id=None):
-    """Update or create the persistent payment tracking embed"""
-    payments = load_payments()
-    embed = create_payment_embed(payments)
-    
-    channel = ctx.channel
-    if channel_id:
-        channel = bot.get_channel(channel_id)
-        if not channel:
-            channel = ctx.channel
-    
-    try:
-        await channel.send(embed=embed)
-    except Exception as e:
-        print(f"Error updating payment embed: {e}")
-
 @bot.command(name="pay")
 @commands.has_permissions(administrator=True)
 async def pay(ctx, username: str, amount: float):
-    """Record a payment. This subtracts from their balance."""
     if amount <= 0:
         return await ctx.send("❌ Amount must be greater than 0.")
-    
     payments = load_payments()
-    
     if username not in payments:
-        return await ctx.send(f"❌ {username} not found in payment system. Use `!pay_add` first.")
-    
+        return await ctx.send(f"❌ {username} not found. Use `!pay_add` first.")
     if payments[username] < amount:
         await ctx.send(f"⚠️ Warning: {username} only has ${payments[username]:,.2f} owed. Proceeding anyway...")
-    
     payments[username] -= amount
-    
     if payments[username] <= 0:
         del payments[username]
         await ctx.send(f"✅ Paid **${amount:,.2f}** to **{username}**. Balance cleared!")
     else:
         await ctx.send(f"✅ Paid **${amount:,.2f}** to **{username}**.")
-    
     save_payments(payments)
+
 
 @bot.command(name="pay_add")
 @commands.has_permissions(administrator=True)
 async def pay_add(ctx, username: str, amount: float):
-    """Add/update payment owed."""
     if amount <= 0:
         return await ctx.send("❌ Amount must be greater than 0.")
-    
     payments = load_payments()
-    
     if username in payments:
         old_amount = payments[username]
         payments[username] += amount
@@ -1223,41 +1094,35 @@ async def pay_add(ctx, username: str, amount: float):
     else:
         payments[username] = amount
         action_text = f"Added **{username}** to payment tracker with **${amount:,.2f}**"
-    
     save_payments(payments)
     await ctx.send(f"✅ {action_text}. New balance: **${payments[username]:,.2f}**")
+
 
 @bot.command(name="pay_remove")
 @commands.has_permissions(administrator=True)
 async def pay_remove(ctx, username: str):
-    """Remove someone from the payment tracker completely."""
     payments = load_payments()
-    
     if username not in payments:
-        return await ctx.send(f"❌ {username} not found in payment system.")
-    
+        return await ctx.send(f"❌ {username} not found.")
     removed_amount = payments[username]
     del payments[username]
     save_payments(payments)
-    
     await ctx.send(f"✅ Removed **{username}** from payment tracker (was owed ${removed_amount:,.2f})")
+
 
 @bot.command(name="pay_list")
 async def pay_list(ctx):
-    """Display current payment balances (anyone can view)"""
     payments = load_payments()
     embed = create_payment_embed(payments)
     await ctx.send(embed=embed)
 
+
 @bot.command(name="pay_reset")
 @commands.has_permissions(administrator=True)
 async def pay_reset(ctx):
-    """Reset all payment data (requires confirmation)"""
     await ctx.send("⚠️ Are you sure you want to reset ALL payment data? Type `yes` to confirm.")
-    
     def check(m):
         return m.author == ctx.author and m.channel == ctx.channel and m.content.lower() == "yes"
-    
     try:
         await bot.wait_for("message", check=check, timeout=30)
         save_payments({})
@@ -1265,23 +1130,95 @@ async def pay_reset(ctx):
     except asyncio.TimeoutError:
         await ctx.send("❌ Reset cancelled (timed out).")
 
+
 # -------------------------
 # Support Ticket Command
 # -------------------------
 @bot.command(name="ticket")
 async def ticket(ctx):
-    """Send ticket creation embed"""
     embed = discord.Embed(
         title="📢 **Support System** 🎫",
-        description=(
-            "Need help? Click the button below to create a support ticket!\n\n"
-            "A private support channel will be created for you where staff can assist you."
-        ),
+        description="Need help? Click the button below to create a support ticket!\n\nA private support channel will be created for you where staff can assist you.",
         color=discord.Color.blue()
     )
     embed.set_footer(text="Support Ticket System")
     view = ReportView()
     await ctx.send(embed=embed, view=view)
+
+
+# -------------------------
+# NEW: Ticket Stats Command
+# -------------------------
+@bot.command(name="ticket_stats")
+@commands.has_permissions(manage_messages=True)
+async def ticket_stats(ctx):
+    """Display ticket statistics for this server"""
+    ticket_data = load_ticket_data()
+    guild_str = str(ctx.guild.id)
+
+    if guild_str not in ticket_data or not ticket_data[guild_str].get("tickets"):
+        return await ctx.send("📭 No ticket data found for this server.")
+
+    tickets = ticket_data[guild_str]["tickets"]
+    total = len(tickets)
+    open_count = sum(1 for t in tickets.values() if t.get("status") == "open")
+    closed_count = sum(1 for t in tickets.values() if t.get("status") == "closed")
+
+    # Average close time
+    close_times = []
+    for t in tickets.values():
+        if t.get("created_at") and t.get("closed_at"):
+            try:
+                created = datetime.fromisoformat(t["created_at"])
+                closed = datetime.fromisoformat(t["closed_at"])
+                diff = (closed - created).total_seconds() / 60  # in minutes
+                close_times.append(diff)
+            except:
+                pass
+
+    avg_close_str = "N/A"
+    if close_times:
+        avg_minutes = sum(close_times) / len(close_times)
+        if avg_minutes < 60:
+            avg_close_str = f"{avg_minutes:.1f} minutes"
+        elif avg_minutes < 1440:
+            avg_close_str = f"{avg_minutes / 60:.1f} hours"
+        else:
+            avg_close_str = f"{avg_minutes / 1440:.1f} days"
+
+    # Ratings
+    ratings = [t["rating"] for t in tickets.values() if t.get("rating")]
+    avg_rating_str = "No ratings yet"
+    if ratings:
+        avg = sum(ratings) / len(ratings)
+        avg_rating_str = f"{'⭐' * round(avg)} ({avg:.1f}/5 from {len(ratings)} ratings)"
+
+    # Category breakdown
+    categories = defaultdict(int)
+    for t in tickets.values():
+        cat = t.get("category", "Unknown")
+        categories[cat] += 1
+    top_categories = sorted(categories.items(), key=lambda x: x[1], reverse=True)[:3]
+
+    embed = discord.Embed(
+        title="📊 Ticket Statistics",
+        description=f"Support ticket overview for **{ctx.guild.name}**",
+        color=discord.Color.blurple(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.add_field(name="🎫 Total Tickets", value=str(total), inline=True)
+    embed.add_field(name="🔵 Open", value=str(open_count), inline=True)
+    embed.add_field(name="🔒 Closed", value=str(closed_count), inline=True)
+    embed.add_field(name="⏱️ Avg Close Time", value=avg_close_str, inline=True)
+    embed.add_field(name="⭐ Avg Rating", value=avg_rating_str, inline=False)
+
+    if top_categories:
+        cat_text = "\n".join([f"• {cat}: **{count}**" for cat, count in top_categories])
+        embed.add_field(name="📋 Top Categories", value=cat_text, inline=False)
+
+    embed.set_footer(text=f"Requested by {ctx.author.display_name}")
+    await ctx.send(embed=embed)
+
 
 # -------------------------
 # Delete Messages Command
@@ -1289,13 +1226,11 @@ async def ticket(ctx):
 @bot.command(name="delete")
 @commands.has_permissions(administrator=True)
 async def delete(ctx, number: int):
-    """Delete a specified number of messages"""
     if number < 1:
-        await ctx.send("❌ You must delete at least 1 message.")
-        return
-
+        return await ctx.send("❌ You must delete at least 1 message.")
     deleted = await ctx.channel.purge(limit=number + 1)
     await ctx.send(f"🗑️ Deleted {len(deleted) - 1} message(s).", delete_after=5)
+
 
 # -------------------------
 # Anti-Spam Admin Commands
@@ -1303,13 +1238,7 @@ async def delete(ctx, number: int):
 @bot.command(name="spam_info")
 @commands.has_permissions(administrator=True)
 async def spam_info(ctx):
-    """Display current anti-spam settings and muted users"""
-    embed = discord.Embed(
-        title="🛡️ Anti-Spam System Info",
-        description="Current spam protection configuration",
-        color=discord.Color.blurple()
-    )
-    
+    embed = discord.Embed(title="🛡️ Anti-Spam System Info", description="Current spam protection configuration", color=discord.Color.blurple())
     embed.add_field(
         name="Settings",
         value=(
@@ -1319,7 +1248,6 @@ async def spam_info(ctx):
         ),
         inline=False
     )
-    
     if anti_spam.muted_users:
         muted_list = []
         for user_id, unmute_time in anti_spam.muted_users.items():
@@ -1330,127 +1258,86 @@ async def spam_info(ctx):
                     muted_list.append(f"• {user.mention} - {int(remaining)}s remaining")
                 except:
                     muted_list.append(f"• User ID: {user_id} - {int(remaining)}s remaining")
-        
         if muted_list:
-            embed.add_field(
-                name=f"Currently Muted Users ({len(muted_list)})",
-                value="\n".join(muted_list),
-                inline=False
-            )
+            embed.add_field(name=f"Currently Muted Users ({len(muted_list)})", value="\n".join(muted_list), inline=False)
     else:
         embed.add_field(name="Muted Users", value="None", inline=False)
-    
     await ctx.send(embed=embed)
+
 
 @bot.command(name="unmute_user")
 @commands.has_permissions(administrator=True)
 async def unmute_user(ctx, member: discord.Member):
-    """Manually unmute a user"""
     if member.id in anti_spam.muted_users:
         del anti_spam.muted_users[member.id]
         await ctx.send(f"✅ {member.mention} has been unmuted.")
     else:
         await ctx.send(f"❌ {member.mention} is not currently muted.")
 
+
 @bot.command(name="spam_config")
 @commands.has_permissions(administrator=True)
 async def spam_config(ctx, messages: int = None, interval: int = None, timeout: int = None):
-    """Configure anti-spam settings"""
     if messages is None or interval is None or timeout is None:
         embed = discord.Embed(
             title="⚙️ Anti-Spam Configuration",
-            description=(
-                "Usage: `!spam_config <max_messages> <interval_seconds> <timeout_seconds>`\n\n"
-                "Example: `!spam_config 5 5 300`\n"
-                "This means: 5 messages per 5 seconds = mute for 5 minutes"
-            ),
+            description="Usage: `!spam_config <max_messages> <interval_seconds> <timeout_seconds>`\n\nExample: `!spam_config 5 5 300`",
             color=discord.Color.orange()
         )
-        await ctx.send(embed=embed)
-        return
-    
+        return await ctx.send(embed=embed)
     if messages < 1 or interval < 1 or timeout < 1:
         return await ctx.send("❌ All values must be greater than 0.")
-    
     anti_spam.messages_per_interval = messages
     anti_spam.interval_seconds = interval
     anti_spam.timeout_seconds = timeout
-    
-    embed = discord.Embed(
-        title="✅ Anti-Spam Configuration Updated",
-        color=discord.Color.green()
-    )
+    embed = discord.Embed(title="✅ Anti-Spam Configuration Updated", color=discord.Color.green())
     embed.add_field(name="Max Messages", value=str(messages), inline=True)
     embed.add_field(name="Time Window", value=f"{interval}s", inline=True)
     embed.add_field(name="Mute Duration", value=f"{timeout}s ({timeout // 60}m)", inline=True)
-    
     await ctx.send(embed=embed)
+
 
 # -------------------------
 # Silent Channel Commands
 # -------------------------
 @bot.command(name="silent_channels")
 @commands.has_permissions(administrator=True)
-async def silent_channels(ctx):
-    """View channels with silent mode enabled"""
-    embed = discord.Embed(
-        title="🔕 Silent Channels",
-        description="Channels that are silent by default. Only admin messages trigger @everyone notifications.",
-        color=discord.Color.blurple()
-    )
-    
+async def silent_channels_cmd(ctx):
+    embed = discord.Embed(title="🔕 Silent Channels", description="Channels that are silent by default.", color=discord.Color.blurple())
     if SILENT_CHANNELS:
         for channel_id, channel_name in SILENT_CHANNELS.items():
             channel = ctx.guild.get_channel(channel_id)
             if channel:
-                embed.add_field(
-                    name=channel.mention,
-                    value=f"**Mode:** Silent by default\n**ID:** {channel_id}",
-                    inline=False
-                )
+                embed.add_field(name=channel.mention, value=f"**Mode:** Silent\n**ID:** {channel_id}", inline=False)
     else:
         embed.add_field(name="No Silent Channels", value="No channels are currently in silent mode", inline=False)
-    
     await ctx.send(embed=embed)
+
 
 @bot.command(name="enable_silent")
 @commands.has_permissions(administrator=True)
 async def enable_silent(ctx, channel: discord.TextChannel = None):
-    """Enable silent mode for a channel"""
     if channel is None:
         channel = ctx.channel
-    
     if channel.id in SILENT_CHANNELS:
         return await ctx.send(f"❌ {channel.mention} is already in silent mode.")
-    
     SILENT_CHANNELS[channel.id] = channel.name
     await setup_silent_channel(channel.id, ctx.guild)
-    
-    embed = discord.Embed(
-        title="✅ Silent Mode Enabled",
-        description=f"{channel.mention} is now silent by default.\n\nOnly admin messages with @everyone will trigger notifications.",
-        color=discord.Color.green()
-    )
+    embed = discord.Embed(title="✅ Silent Mode Enabled", description=f"{channel.mention} is now silent by default.", color=discord.Color.green())
     await ctx.send(embed=embed)
+
 
 @bot.command(name="disable_silent")
 @commands.has_permissions(administrator=True)
 async def disable_silent(ctx, channel: discord.TextChannel = None):
-    """Disable silent mode for a channel"""
     if channel is None:
         channel = ctx.channel
-    
     if channel.id not in SILENT_CHANNELS:
         return await ctx.send(f"❌ {channel.mention} is not in silent mode.")
-    
     del SILENT_CHANNELS[channel.id]
-    
-    embed = discord.Embed(
-        title="✅ Silent Mode Disabled",
-        description=f"{channel.mention} notifications are now normal.",
-        color=discord.Color.green()
-    )
+    embed = discord.Embed(title="✅ Silent Mode Disabled", description=f"{channel.mention} notifications are now normal.", color=discord.Color.green())
     await ctx.send(embed=embed)
+
 
 # -------------------------
 # Announcement Command
@@ -1458,7 +1345,6 @@ async def disable_silent(ctx, channel: discord.TextChannel = None):
 @bot.command(name="announcement")
 @commands.has_permissions(administrator=True)
 async def announcement(ctx):
-    """Create an announcement"""
     def check(m):
         return m.author == ctx.author and m.channel == ctx.channel
 
@@ -1486,7 +1372,6 @@ async def announcement(ctx):
 
     config = load_server_config(ctx.guild.id)
     announcement_channel_id = config.get("announcement_channel_id")
-    
     if announcement_channel_id:
         channel = ctx.guild.get_channel(announcement_channel_id)
         if channel:
@@ -1498,26 +1383,23 @@ async def announcement(ctx):
         await ctx.send(embed=embed)
         await ctx.send("ℹ️ Use `!setup` to set an announcement channel.")
 
+
 # -------------------------
 # Setup Command
 # -------------------------
 @bot.command(name="setup")
 @commands.has_permissions(administrator=True)
 async def setup(ctx):
-    """Interactive server setup"""
     embed = discord.Embed(
         title="⚙️ Server Setup",
         description="Let's configure the bot for your server!\n\n**You'll need the IDs for your role and channels.**\nEnable Developer Mode in Discord settings to copy IDs.",
         color=discord.Color.blue()
     )
     await ctx.send(embed=embed)
-    
     config = load_server_config(ctx.guild.id)
-    
     def check(m):
         return m.author == ctx.author and m.channel == ctx.channel
-    
-    # Step 1: Verified Role ID
+
     await ctx.send("🔐 **Step 1:** Paste the **Role ID** for the verified role, or type `skip`:")
     try:
         msg = await bot.wait_for("message", check=check, timeout=60)
@@ -1527,15 +1409,14 @@ async def setup(ctx):
                 role = ctx.guild.get_role(role_id)
                 if role:
                     config["verified_role_id"] = role_id
-                    await ctx.send(f"✅ Verified role set to **{role.name}** (ID: `{role_id}`)")
+                    await ctx.send(f"✅ Verified role set to **{role.name}**")
                 else:
-                    await ctx.send(f"⚠️ No role found with ID `{role_id}` in this server. Skipping.")
+                    await ctx.send(f"⚠️ No role found with that ID. Skipping.")
             except ValueError:
-                await ctx.send("⚠️ That doesn't look like a valid ID (numbers only). Skipping.")
+                await ctx.send("⚠️ Invalid ID. Skipping.")
     except asyncio.TimeoutError:
         await ctx.send("⏱️ Timeout, skipping...")
 
-    # Step 2: Announcement Channel ID
     await ctx.send("📢 **Step 2:** Paste the **Channel ID** for announcements, or type `skip`:")
     try:
         msg = await bot.wait_for("message", check=check, timeout=60)
@@ -1545,15 +1426,14 @@ async def setup(ctx):
                 channel = ctx.guild.get_channel(channel_id)
                 if channel:
                     config["announcement_channel_id"] = channel_id
-                    await ctx.send(f"✅ Announcement channel set to **{channel.name}** (ID: `{channel_id}`)")
+                    await ctx.send(f"✅ Announcement channel set to **{channel.name}**")
                 else:
-                    await ctx.send(f"⚠️ No channel found with ID `{channel_id}` in this server. Skipping.")
+                    await ctx.send(f"⚠️ No channel found with that ID. Skipping.")
             except ValueError:
-                await ctx.send("⚠️ That doesn't look like a valid ID (numbers only). Skipping.")
+                await ctx.send("⚠️ Invalid ID. Skipping.")
     except asyncio.TimeoutError:
         await ctx.send("⏱️ Timeout, skipping...")
 
-    # Step 3: Stats Channel ID
     await ctx.send("📊 **Step 3:** Paste the **Channel ID** for member count stats, or type `skip`:")
     try:
         msg = await bot.wait_for("message", check=check, timeout=60)
@@ -1563,102 +1443,196 @@ async def setup(ctx):
                 channel = ctx.guild.get_channel(channel_id)
                 if channel:
                     config["stats_channel_id"] = channel_id
-                    await ctx.send(f"✅ Stats channel set to **{channel.name}** (ID: `{channel_id}`)")
+                    await ctx.send(f"✅ Stats channel set to **{channel.name}**")
                 else:
-                    await ctx.send(f"⚠️ No channel found with ID `{channel_id}` in this server. Skipping.")
+                    await ctx.send(f"⚠️ No channel found with that ID. Skipping.")
             except ValueError:
-                await ctx.send("⚠️ That doesn't look like a valid ID (numbers only). Skipping.")
+                await ctx.send("⚠️ Invalid ID. Skipping.")
     except asyncio.TimeoutError:
         await ctx.send("⏱️ Timeout, skipping...")
 
     save_server_config(ctx.guild.id, config)
 
-    # Final summary
-    final_embed = discord.Embed(
-        title="✅ Setup Complete!",
-        description="Your server has been configured successfully.",
-        color=discord.Color.green()
-    )
-
+    final_embed = discord.Embed(title="✅ Setup Complete!", description="Your server has been configured.", color=discord.Color.green())
     configured_items = []
     if config.get("verified_role_id"):
         role = ctx.guild.get_role(config["verified_role_id"])
-        configured_items.append(f"🔐 Verified Role: **{role.name if role else 'Unknown'}** (`{config['verified_role_id']}`)")
+        configured_items.append(f"🔐 Verified Role: **{role.name if role else 'Unknown'}**")
     if config.get("announcement_channel_id"):
         ch = ctx.guild.get_channel(config["announcement_channel_id"])
-        configured_items.append(f"📢 Announcement Channel: **{ch.name if ch else 'Unknown'}** (`{config['announcement_channel_id']}`)")
+        configured_items.append(f"📢 Announcement Channel: **{ch.name if ch else 'Unknown'}**")
     if config.get("stats_channel_id"):
         ch = ctx.guild.get_channel(config["stats_channel_id"])
-        configured_items.append(f"📊 Stats Channel: **{ch.name if ch else 'Unknown'}** (`{config['stats_channel_id']}`)")
-
+        configured_items.append(f"📊 Stats Channel: **{ch.name if ch else 'Unknown'}**")
     if configured_items:
         final_embed.add_field(name="Configured Settings", value="\n".join(configured_items), inline=False)
     else:
         final_embed.add_field(name="⚠️ Nothing Configured", value="All steps were skipped.", inline=False)
-
     await ctx.send(embed=final_embed)
 
-# -------------------------
-# Admin Help Command
-# -------------------------
-@bot.command(name="help")
-async def help_command(ctx):
-    """Display bot commands"""
-    embeds = []
-    
-    # Page 1: Basic Commands
-    embed1 = discord.Embed(title="🤖 Bot Commands - Page 1/4", color=discord.Color.blurple())
-    embed1.add_field(name="**BASIC COMMANDS**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    embed1.add_field(name="!help", value="Display this help message", inline=False)
-    embed1.add_field(name="!rules", value="Display server rules", inline=False)
-    embed1.add_field(name="!ticket", value="Create a support ticket", inline=False)
-    embed1.add_field(name="!gstart <time> <winners> <prize>", value="Start a giveaway (Admin)", inline=False)
-    embed1.add_field(name="!flip", value="Flip a coin", inline=False)
-    embeds.append(embed1)
-    
-    # Page 2: Anti-Spam & Silent Channels
-    embed2 = discord.Embed(title="🛡️ Bot Commands - Page 2/4", color=discord.Color.orange())
-    embed2.add_field(name="**ANTI-SPAM COMMANDS (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    embed2.add_field(name="!spam_info", value="Display anti-spam settings", inline=False)
-    embed2.add_field(name="!unmute_user <member>", value="Manually unmute a user", inline=False)
-    embed2.add_field(name="!spam_config <msgs> <interval> <timeout>", value="Configure anti-spam", inline=False)
-    
-    embed2.add_field(name="**SILENT CHANNEL COMMANDS (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    embed2.add_field(name="!silent_channels", value="View silent channels", inline=False)
-    embed2.add_field(name="!enable_silent [channel]", value="Enable silent mode", inline=False)
-    embed2.add_field(name="!disable_silent [channel]", value="Disable silent mode", inline=False)
-    embeds.append(embed2)
-    
-    # Page 3: Payment & Verification
-    embed3 = discord.Embed(title="💰 Bot Commands - Page 3/4", color=discord.Color.green())
-    embed3.add_field(name="**PAYMENT TRACKING (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    embed3.add_field(name="!pay <username> <amount>", value="Record a payment", inline=False)
-    embed3.add_field(name="!pay_add <username> <amount>", value="Add amount owed", inline=False)
-    embed3.add_field(name="!pay_remove <username>", value="Remove from tracker", inline=False)
-    embed3.add_field(name="!pay_list", value="Display payment balances", inline=False)
-    
-    embed3.add_field(name="**VERIFICATION (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    embed3.add_field(name="!verify [member]", value="Manually verify a member", inline=False)
-    embed3.add_field(name="!sendverify", value="Send verification button", inline=False)
-    embeds.append(embed3)
-    
-    # Page 4: Management
-    embed4 = discord.Embed(title="⚙️ Bot Commands - Page 4/4", color=discord.Color.red())
-    embed4.add_field(name="**SERVER MANAGEMENT (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    embed4.add_field(name="!setup", value="Interactive server configuration", inline=False)
-    embed4.add_field(name="!delete <number>", value="Delete messages", inline=False)
-    embed4.add_field(name="!announcement", value="Create an announcement", inline=False)
-    
-    embed4.add_field(name="**SUPPORT**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    embed4.add_field(name="Support Server", value="[Join our support server](https://discord.gg/PMDtKbUfEA)", inline=False)
-    embed4.add_field(name="Invite Bot", value="[Invite this bot to your server](https://discord.com/oauth2/authorize?client_id=YOUR_BOT_ID&permissions=8&scope=bot)", inline=False)
-    embeds.append(embed4)
-    
-    for embed in embeds:
-        await ctx.send(embed=embed)
 
 # -------------------------
-# 🎁 GIVEAWAY SYSTEM
+# NEW: User Info Command
+# -------------------------
+@bot.command(name="userinfo")
+async def userinfo(ctx, member: discord.Member = None):
+    """Display detailed info about a member"""
+    if member is None:
+        member = ctx.author
+
+    now = datetime.now(timezone.utc)
+    account_age_days = (now - member.created_at).days
+    join_age_days = (now - member.joined_at).days if member.joined_at else 0
+
+    # Check verification status from file
+    verification_data = load_verifications()
+    user_verification = verification_data.get(str(member.id))
+
+    if user_verification:
+        verified_at = datetime.fromisoformat(user_verification["verified_at"])
+        verify_status = f"✅ Verified <t:{int(verified_at.timestamp())}:R>"
+        risk_level = user_verification.get("risk_level", "unknown")
+        verify_method = user_verification.get("method", "unknown")
+    else:
+        verify_status = "❌ Not Verified"
+        risk_level = "N/A"
+        verify_method = "N/A"
+
+    # Roles (exclude @everyone)
+    roles = [r.mention for r in reversed(member.roles) if r.name != "@everyone"]
+    roles_str = " ".join(roles) if roles else "No roles"
+    if len(roles_str) > 1000:
+        roles_str = f"{len(roles)} roles"
+
+    embed = discord.Embed(
+        title=f"👤 User Info — {member.display_name}",
+        color=member.color if member.color != discord.Color.default() else discord.Color.blurple(),
+        timestamp=now
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+
+    embed.add_field(name="🪪 Username", value=str(member), inline=True)
+    embed.add_field(name="🆔 User ID", value=str(member.id), inline=True)
+    embed.add_field(name="🤖 Bot?", value="Yes" if member.bot else "No", inline=True)
+
+    embed.add_field(
+        name="📅 Account Created",
+        value=f"<t:{int(member.created_at.timestamp())}:F>\n({account_age_days} days ago)",
+        inline=True
+    )
+    embed.add_field(
+        name="📥 Joined Server",
+        value=f"<t:{int(member.joined_at.timestamp())}:F>\n({join_age_days} days ago)" if member.joined_at else "Unknown",
+        inline=True
+    )
+    embed.add_field(name="🖼️ Avatar", value="Custom" if member.avatar else "Default", inline=True)
+
+    embed.add_field(name="🔐 Verification Status", value=verify_status, inline=True)
+    embed.add_field(name="🛡️ Risk Level", value=risk_level.capitalize(), inline=True)
+    embed.add_field(name="🔑 Verify Method", value=verify_method.replace("_", " ").title(), inline=True)
+
+    embed.add_field(name=f"🏷️ Roles ({len(roles)})", value=roles_str, inline=False)
+
+    embed.set_footer(text=f"Requested by {ctx.author.display_name}")
+    await ctx.send(embed=embed)
+
+
+# -------------------------
+# NEW: Server Info Command
+# -------------------------
+@bot.command(name="serverinfo")
+async def serverinfo(ctx):
+    """Display server statistics and info"""
+    guild = ctx.guild
+    now = datetime.now(timezone.utc)
+    age_days = (now - guild.created_at).days
+
+    # Member counts
+    total = guild.member_count
+    bots = sum(1 for m in guild.members if m.bot)
+    humans = total - bots
+    online = sum(1 for m in guild.members if m.status != discord.Status.offline) if hasattr(guild, 'members') else "N/A"
+
+    # Channel counts
+    text_channels = len(guild.text_channels)
+    voice_channels = len(guild.voice_channels)
+    categories = len(guild.categories)
+
+    # Boost info
+    boost_level = guild.premium_tier
+    boost_count = guild.premium_subscription_count or 0
+
+    embed = discord.Embed(
+        title=f"🏠 {guild.name}",
+        description=guild.description or "No description set.",
+        color=discord.Color.blurple(),
+        timestamp=now
+    )
+
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    if guild.banner:
+        embed.set_image(url=guild.banner.url)
+
+    embed.add_field(name="🆔 Server ID", value=str(guild.id), inline=True)
+    embed.add_field(name="👑 Owner", value=guild.owner.mention if guild.owner else "Unknown", inline=True)
+    embed.add_field(name="📅 Created", value=f"<t:{int(guild.created_at.timestamp())}:F>\n({age_days} days ago)", inline=True)
+
+    embed.add_field(name="👥 Members", value=f"Total: **{total}**\nHumans: **{humans}**\nBots: **{bots}**", inline=True)
+    embed.add_field(name="💬 Channels", value=f"Text: **{text_channels}**\nVoice: **{voice_channels}**\nCategories: **{categories}**", inline=True)
+    embed.add_field(name="🎭 Roles", value=str(len(guild.roles)), inline=True)
+
+    embed.add_field(name="🚀 Boost Level", value=f"Level **{boost_level}**", inline=True)
+    embed.add_field(name="💎 Boosts", value=str(boost_count), inline=True)
+    embed.add_field(name="😀 Emojis", value=f"{len(guild.emojis)}/{guild.emoji_limit}", inline=True)
+
+    embed.add_field(name="🔒 Verification Level", value=str(guild.verification_level).replace("_", " ").title(), inline=True)
+    embed.add_field(name="🌍 Region", value="Automatic (Discord)", inline=True)
+
+    embed.set_footer(text=f"Requested by {ctx.author.display_name}")
+    await ctx.send(embed=embed)
+
+
+# -------------------------
+# NEW: Remind Me Command
+# -------------------------
+@bot.command(name="remindme")
+async def remindme(ctx, time_str: str, *, message: str):
+    """Set a personal reminder. Example: !remindme 1h30m Check the oven"""
+    seconds = convert_time(time_str)
+    if seconds == 0:
+        return await ctx.send("❌ Invalid time format. Examples: `30s`, `10m`, `2h`, `1d`, `1h30m`")
+
+    if seconds < 10:
+        return await ctx.send("❌ Minimum reminder time is 10 seconds.")
+    if seconds > 2592000:  # 30 days
+        return await ctx.send("❌ Maximum reminder time is 30 days.")
+
+    due_time = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+    timestamp = int(due_time.timestamp())
+
+    reminders = load_reminders()
+    reminders.append({
+        "user_id": ctx.author.id,
+        "message": message,
+        "due": due_time.isoformat(),
+        "set_at": datetime.now(timezone.utc).isoformat(),
+        "channel_id": ctx.channel.id
+    })
+    save_reminders(reminders)
+
+    embed = discord.Embed(
+        title="⏰ Reminder Set!",
+        description=f"I'll remind you via DM at <t:{timestamp}:F> (<t:{timestamp}:R>).",
+        color=discord.Color.blurple()
+    )
+    embed.add_field(name="📝 Message", value=message, inline=False)
+    embed.set_footer(text="Make sure your DMs are open so I can reach you!")
+    await ctx.send(embed=embed)
+
+
+# -------------------------
+# Giveaway System
 # -------------------------
 def convert_time(time_str):
     """Converts 1h, 30m, 10s into seconds"""
@@ -1672,20 +1646,16 @@ def convert_time(time_str):
         elif unit == "d": total_seconds += int(value) * 86400
     return total_seconds
 
+
 @bot.command(name="gstart")
 @commands.has_permissions(administrator=True)
 async def gstart(ctx, duration: str, winners: int, *, prize: str):
-    """Start a giveaway"""
     await ctx.message.delete()
-
     seconds = convert_time(duration)
     if seconds == 0:
-        await ctx.send("❌ Invalid time format. Use 10s, 30m, 1h, 1d.", delete_after=10)
-        return
-
+        return await ctx.send("❌ Invalid time format. Use 10s, 30m, 1h, 1d.", delete_after=10)
     end_time = datetime.now(timezone.utc) + timedelta(seconds=seconds)
     timestamp = int(end_time.timestamp())
-
     embed = discord.Embed(
         title="🎉 **GIVEAWAY** 🎉",
         description=(
@@ -1697,61 +1667,116 @@ async def gstart(ctx, duration: str, winners: int, *, prize: str):
         color=discord.Color.gold()
     )
     embed.set_footer(text="React with 🎉 to enter!")
-
     msg = await ctx.send(embed=embed)
     await msg.add_reaction("🎉")
-
     await asyncio.sleep(seconds)
-
     new_msg = await ctx.channel.fetch_message(msg.id)
-    
     users = []
     async for user in new_msg.reactions[0].users():
         if not user.bot:
             users.append(user)
-
     if len(users) < winners:
-        await ctx.send("❌ Not enough entrants to determine a winner.")
-        return
-
+        return await ctx.send("❌ Not enough entrants to determine a winner.")
     won_users = random.sample(users, winners)
     winners_mention = ", ".join([user.mention for user in won_users])
-
     await ctx.send(f"🎉 **CONGRATULATIONS** {winners_mention}! You won **{prize}**!")
-    
     embed.description += f"\n\n🏆 **Winner:** {winners_mention}"
     embed.color = discord.Color.green()
     embed.set_footer(text="Giveaway Ended")
     await msg.edit(embed=embed)
 
+
 # -------------------------
-# 🪙 FUN COMMANDS
+# Fun Commands
 # -------------------------
 @bot.command(name="flip")
 async def flip(ctx):
-    """Simple 50/50 Coin Flip"""
     choices = ["Heads", "Tails"]
     result = random.choice(choices)
-    
     embed = discord.Embed(title="🪙 Coin Flip", color=discord.Color.gold())
-    
     msg = await ctx.send(embed=discord.Embed(title="🪙 Flipping...", color=discord.Color.light_grey()))
     await asyncio.sleep(1)
-    
     embed.description = f"**{result.upper()}**"
     await msg.edit(embed=embed)
+
+
+# -------------------------
+# UPDATED Help Command (all pages)
+# -------------------------
+@bot.command(name="help")
+async def help_command(ctx):
+    embeds = []
+
+    # Page 1: Basic Commands
+    embed1 = discord.Embed(title="🤖 Bot Commands — Page 1/5", color=discord.Color.blurple())
+    embed1.add_field(name="**BASIC COMMANDS**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    embed1.add_field(name="!help", value="Display this help message", inline=False)
+    embed1.add_field(name="!rules", value="Display server rules", inline=False)
+    embed1.add_field(name="!ticket", value="Create a support ticket", inline=False)
+    embed1.add_field(name="!gstart <time> <winners> <prize>", value="Start a giveaway (Admin)", inline=False)
+    embed1.add_field(name="!flip", value="Flip a coin", inline=False)
+    embeds.append(embed1)
+
+    # Page 2: Anti-Spam & Silent Channels
+    embed2 = discord.Embed(title="🛡️ Bot Commands — Page 2/5", color=discord.Color.orange())
+    embed2.add_field(name="**ANTI-SPAM COMMANDS (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    embed2.add_field(name="!spam_info", value="Display anti-spam settings and muted users", inline=False)
+    embed2.add_field(name="!unmute_user <member>", value="Manually unmute a user", inline=False)
+    embed2.add_field(name="!spam_config <msgs> <interval> <timeout>", value="Configure anti-spam thresholds", inline=False)
+    embed2.add_field(name="**SILENT CHANNEL COMMANDS (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    embed2.add_field(name="!silent_channels", value="View all channels with silent mode enabled", inline=False)
+    embed2.add_field(name="!enable_silent [channel]", value="Enable silent mode for a channel", inline=False)
+    embed2.add_field(name="!disable_silent [channel]", value="Disable silent mode for a channel", inline=False)
+    embeds.append(embed2)
+
+    # Page 3: Payment & Verification
+    embed3 = discord.Embed(title="💰 Bot Commands — Page 3/5", color=discord.Color.green())
+    embed3.add_field(name="**PAYMENT TRACKING (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    embed3.add_field(name="!pay <username> <amount>", value="Record a payment (subtracts from balance)", inline=False)
+    embed3.add_field(name="!pay_add <username> <amount>", value="Add an amount owed to a user", inline=False)
+    embed3.add_field(name="!pay_remove <username>", value="Remove a user from the tracker", inline=False)
+    embed3.add_field(name="!pay_list", value="Display all current payment balances", inline=False)
+    embed3.add_field(name="!pay_reset", value="Reset all payment data (requires confirmation)", inline=False)
+    embed3.add_field(name="**VERIFICATION (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    embed3.add_field(name="!verify [member]", value="Manually verify a member", inline=False)
+    embed3.add_field(name="!sendverify", value="Send the verification button embed", inline=False)
+    embeds.append(embed3)
+
+    # Page 4: Utility (NEW)
+    embed4 = discord.Embed(title="📊 Bot Commands — Page 4/5", color=discord.Color.teal())
+    embed4.add_field(name="**UTILITY COMMANDS**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    embed4.add_field(name="!userinfo [member]", value="Show detailed info about a member — join date, roles, account age, verification status", inline=False)
+    embed4.add_field(name="!serverinfo", value="Show server stats — member count, channels, boosts, creation date and more", inline=False)
+    embed4.add_field(name="!remindme <time> <message>", value="Set a personal reminder delivered via DM\nExamples: `!remindme 30m Check oven` / `!remindme 1h30m Meeting`", inline=False)
+    embed4.add_field(name="**TICKET TOOLS (Staff)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    embed4.add_field(name="!ticket_stats", value="View ticket statistics — total, open/closed count, avg close time, avg rating and top categories", inline=False)
+    embed4.add_field(name="⭐ Ticket Rating", value="When a ticket closes, the user is automatically sent a 1–5 star rating request via DM", inline=False)
+    embeds.append(embed4)
+
+    # Page 5: Server Management
+    embed5 = discord.Embed(title="⚙️ Bot Commands — Page 5/5", color=discord.Color.red())
+    embed5.add_field(name="**SERVER MANAGEMENT (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    embed5.add_field(name="!setup", value="Interactive server configuration wizard", inline=False)
+    embed5.add_field(name="!delete <number>", value="Bulk delete messages from a channel", inline=False)
+    embed5.add_field(name="!announcement", value="Create and send a server announcement", inline=False)
+    embed5.add_field(name="**SUPPORT**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    embed5.add_field(name="Support Server", value="[Join our support server](https://discord.gg/PMDtKbUfEA)", inline=False)
+    embed5.add_field(name="Invite Bot", value="[Invite this bot to your server](https://discord.com/oauth2/authorize?client_id=YOUR_BOT_ID&permissions=8&scope=bot)", inline=False)
+    embeds.append(embed5)
+
+    for embed in embeds:
+        await ctx.send(embed=embed)
+
 
 # -------------------------
 # Run the bot
 # -------------------------
 if __name__ == "__main__":
     TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-    
     if not TOKEN:
         print("❌ ERROR: DISCORD_BOT_TOKEN not found in environment variables!")
         print("Please create a .env file with: DISCORD_BOT_TOKEN=your_token_here")
         exit(1)
-    
     try:
         bot.run(TOKEN)
     except Exception as e:
