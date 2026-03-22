@@ -94,6 +94,13 @@ Professional Discord bot hosting with full setup and management included. No tec
 - Automatic HTML transcripts
 - Ticket claiming and user management
 - Professional ticket interface
+- **NEW: 1–5 star rating system** — users are automatically sent a rating request via DM when their ticket closes
+- **NEW: `!ticket_stats`** — staff can view total tickets, open/closed counts, average close time, average rating, and top categories
+
+### 📊 **Utility Commands**
+- **NEW: `!userinfo [member]`** — displays join date, account age, roles, avatar type, and full verification status
+- **NEW: `!serverinfo`** — server overview with member count, channels, boosts, role count, emoji usage, and more
+- **NEW: `!remindme <time> <message>`** — set personal reminders delivered via DM (supports `30m`, `1h`, `2h30m`, `1d`, etc.)
 
 ### 💰 **Payment Tracking**
 - Track payments owed to team members
@@ -113,6 +120,18 @@ Professional Discord bot hosting with full setup and management included. No tec
 - Easy setup wizard
 - Stats channel with live member count
 - Automatic bot updates
+
+---
+
+## 📝 Recent Updates
+
+### v1.2.0 — March 2026
+- ✨ Added `!userinfo` — detailed member profile with verification data
+- ✨ Added `!serverinfo` — full server stats embed
+- ✨ Added `!remindme` — personal DM reminders with persistent storage
+- ✨ Added ticket rating system — automatic 1–5 star DM prompt on ticket close
+- ✨ Added `!ticket_stats` — ticket analytics for staff (totals, avg close time, avg rating, top categories)
+- 📖 Help menu expanded to 5 pages with all new commands documented
 
 ---
 
@@ -195,4 +214,4 @@ A: We accept PayPal, credit/debit cards, and cryptocurrency.
 
 ---
 
-*Pricing subject to change. All features and specifications accurate as of January 2026.*
+*Pricing subject to change. All features and specifications accurate as of March 2026.*
