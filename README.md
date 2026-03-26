@@ -212,7 +212,7 @@ Your bot is ready to use immediately. We provide:
 **Contact us to set up your bot today!**
 
 📧 Email: support@dasixbot.xyz  
-💬 Discord: [https://discord.gg/PMDtKbUfEA]  
+💬 Discord: [https://discord.gg/UwWbbyQ7pq]  
 🌐 Website: [https://dasixbot.xyz]
 
 ### Special Launch Offer
