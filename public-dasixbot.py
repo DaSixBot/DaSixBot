@@ -1,5 +1,4 @@
 import os
-import socket
 import discord
 from discord.ext import commands, tasks
 from discord.ui import View, Button, Modal, TextInput, Select
@@ -11,7 +10,7 @@ import io
 import re
 from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta
-from collections import defaultdict
+from collections import defaultdict, deque
 
 # Load environment variables
 load_dotenv()
@@ -24,42 +23,34 @@ class AntiSpamSystem:
         self.messages_per_interval = messages_per_interval
         self.interval_seconds = interval_seconds
         self.timeout_seconds = timeout_seconds
-        
         self.user_messages = defaultdict(list)
         self.muted_users = {}
-    
+
     def is_user_muted(self, user_id):
-        """Check if user is currently muted"""
         if user_id in self.muted_users:
             if datetime.now(timezone.utc) < self.muted_users[user_id]:
                 return True
             else:
                 del self.muted_users[user_id]
         return False
-    
+
     def add_message(self, user_id):
-        """Record a message from user and return if they're spamming"""
         now = datetime.now(timezone.utc)
-        
         cutoff_time = now - timedelta(seconds=self.interval_seconds)
         self.user_messages[user_id] = [
             msg_time for msg_time in self.user_messages[user_id]
             if msg_time > cutoff_time
         ]
-        
         self.user_messages[user_id].append(now)
-        
         if len(self.user_messages[user_id]) > self.messages_per_interval:
             return True
         return False
-    
+
     def mute_user(self, user_id):
-        """Mute a user for the timeout duration"""
         unmute_time = datetime.now(timezone.utc) + timedelta(seconds=self.timeout_seconds)
         self.muted_users[user_id] = unmute_time
-    
+
     def get_mute_remaining(self, user_id):
-        """Get remaining mute time in seconds"""
         if user_id in self.muted_users:
             remaining = (self.muted_users[user_id] - datetime.now(timezone.utc)).total_seconds()
             return max(0, remaining)
@@ -72,42 +63,19 @@ class AntiSpamSystem:
 SILENT_CHANNELS = {}
 
 async def setup_silent_channel(channel_id, guild):
-    """Configure a channel to be silent by default"""
     try:
         channel = guild.get_channel(channel_id)
         if not channel:
             print(f"[SilentMode] Channel {channel_id} not found")
             return
-        
         overwrites = channel.overwrites.get(guild.default_role, discord.PermissionOverwrite())
         overwrites.view_channel = True
         overwrites.send_messages = True
         overwrites.read_message_history = True
-        
         await channel.set_permissions(guild.default_role, overwrite=overwrites)
         print(f"[SilentMode] Channel {channel.name} is now silent by default")
     except Exception as e:
         print(f"[SilentMode] Error setting up silent channel: {e}")
-
-
-# ---------------------------------
-# DNS OVERRIDE WORKAROUND FOR DISCORD
-# ---------------------------------
-DISCORD_IP_MAP = {
-    "discord.com": "162.159.137.232",
-    "gateway.discord.gg": "162.159.130.233",
-}
-
-_original_getaddrinfo = socket.getaddrinfo
-
-def custom_getaddrinfo(host, *args, **kwargs):
-    for domain, ip in DISCORD_IP_MAP.items():
-        if domain in host:
-            print(f"[DNS Override] Resolving {host} as {ip}")
-            return _original_getaddrinfo(ip, *args, **kwargs)
-    return _original_getaddrinfo(host, *args, **kwargs)
-
-socket.getaddrinfo = custom_getaddrinfo
 
 # -------------------------
 # Bot Initialization & Configs
@@ -118,17 +86,18 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 bot.remove_command("help")
 
-# Initialize Anti-Spam System
 anti_spam = AntiSpamSystem(
     messages_per_interval=5,
     interval_seconds=5,
     timeout_seconds=300
 )
 
-# Global variables and constants
 PAYMENTS_FILE = "payments.json"
 CONFIG_FILE = "server_config.json"
 REMINDERS_FILE = "reminders.json"
+
+# Roles allowed to run giveaway commands
+GIVEAWAY_ALLOWED_ROLES = ["Moderator", "Developer", "Support", "Owner"]
 
 # -------------------------
 # Config helpers
@@ -188,9 +157,199 @@ def save_reminders(reminders):
     with open(REMINDERS_FILE, "w") as f:
         json.dump(reminders, f, indent=4)
 
-# ---------------------------------
+# -------------------------
+# TIME CONVERTER UTILITY
+# -------------------------
+def convert_time(time_str):
+    """Converts 1h, 30m, 10s, 1d or combinations into total seconds"""
+    time_regex = re.compile(r"(\d+)([smhd])")
+    matches = time_regex.findall(time_str)
+    total_seconds = 0
+    for value, unit in matches:
+        if unit == "s":   total_seconds += int(value)
+        elif unit == "m": total_seconds += int(value) * 60
+        elif unit == "h": total_seconds += int(value) * 3600
+        elif unit == "d": total_seconds += int(value) * 86400
+    return total_seconds
+
+
+# ==========================================================
+# KICK LIVE ANNOUNCEMENT SYSTEM
+# ==========================================================
+
+KICK_HEADERS = {
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept":          "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer":         "https://kick.com/",
+    "Origin":          "https://kick.com",
+    "DNT":             "1",
+}
+
+kick_live_states = {}
+
+
+# ── !live COMMAND — Interactive Menu ─────────────────────
+
+class LiveChannelSelect(Select):
+    """Step 3 — pick the Discord channel to post in."""
+    def __init__(self, guild: discord.Guild, kick_username: str, category: str):
+        self.kick_username = kick_username
+        self.category = category
+
+        text_channels = [ch for ch in guild.text_channels if ch.permissions_for(guild.me).send_messages][:25]
+        options = [
+            discord.SelectOption(label=f"#{ch.name}", value=str(ch.id))
+            for ch in text_channels
+        ]
+        super().__init__(
+            placeholder="Select announcement channel...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="live_channel_select"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        channel_id = int(self.values[0])
+        channel = interaction.guild.get_channel(channel_id)
+        if not channel:
+            return await interaction.response.send_message("❌ Channel not found.", ephemeral=True)
+
+        now = datetime.now(timezone.utc)
+        timestamp = int(now.timestamp())
+
+        embed = discord.Embed(
+            title=f"🔴  {self.kick_username} is LIVE",
+            color=0x53FC18,  # Kick green
+            timestamp=now
+        )
+        embed.add_field(name="🎮 Category", value=self.category, inline=True)
+        embed.add_field(name="📺 Platform", value="Kick.com", inline=True)
+        embed.add_field(
+            name="🔗 Stream Link",
+            value=f"[**Watch Now → kick.com/{self.kick_username}**](https://kick.com/{self.kick_username})",
+            inline=False
+        )
+        embed.set_footer(text=f"Went live • {now.strftime('%B %d, %Y at %I:%M %p UTC')}")
+
+        view = discord.ui.View()
+        view.add_item(discord.ui.Button(label="▶  Watch Stream", url=f"https://kick.com/{self.kick_username}", style=discord.ButtonStyle.link))
+
+        await channel.send("@everyone", embed=embed, view=view)
+        await interaction.response.edit_message(
+            content=f"✅ Live announcement posted in {channel.mention}!",
+            embed=None,
+            view=None
+        )
+
+
+class LiveCategorySelect(Select):
+    """Step 2 — pick the stream category."""
+    def __init__(self, kick_username: str):
+        self.kick_username = kick_username
+        options = [
+            discord.SelectOption(label="🎰 Slots & Casino",     value="Slots & Casino"),
+            discord.SelectOption(label="🃏 Cases & Packs",      value="Cases & Packs"),
+            discord.SelectOption(label="🎮 Just Chatting",      value="Just Chatting"),
+            discord.SelectOption(label="🎯 Sports Betting",     value="Sports Betting"),
+            discord.SelectOption(label="🎲 Gambling",           value="Gambling"),
+            discord.SelectOption(label="🕹️ Gaming",             value="Gaming"),
+            discord.SelectOption(label="🎵 Music",              value="Music"),
+            discord.SelectOption(label="🎙️ Podcast / IRL",      value="Podcast / IRL"),
+            discord.SelectOption(label="⚽ Sports",             value="Sports"),
+            discord.SelectOption(label="📦 Unboxing",           value="Unboxing"),
+        ]
+        super().__init__(
+            placeholder="Select your stream category...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="live_category_select"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        selected_category = self.values[0]
+        view = discord.ui.View(timeout=120)
+        view.add_item(LiveChannelSelect(interaction.guild, self.kick_username, selected_category))
+
+        embed = discord.Embed(
+            title="📺 Step 3 — Choose Announcement Channel",
+            description=f"**Category:** {selected_category}\n\nWhich channel should the live notification go to?",
+            color=0x53FC18
+        )
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
+class LiveKickUsernameModal(Modal, title="🔴 Go Live — Kick Username"):
+    """Step 1 — enter Kick channel name."""
+    kick_username = TextInput(
+        label="Your Kick.com Username",
+        placeholder="e.g. NotLilKev",
+        max_length=50,
+        style=discord.TextStyle.short
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        username = self.kick_username.value.strip().lstrip("@")
+        if not username:
+            return await interaction.response.send_message("❌ Username cannot be empty.", ephemeral=True)
+
+        view = discord.ui.View(timeout=120)
+        view.add_item(LiveCategorySelect(username))
+
+        embed = discord.Embed(
+            title="📺 Step 2 — Select Your Category",
+            description=f"**Kick Channel:** kick.com/{username}\n\nWhat category are you streaming in?",
+            color=0x53FC18
+        )
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+@bot.command(name="live")
+async def live(ctx: commands.Context):
+    """Streamer types !live — launches interactive menu to post a live announcement."""
+    allowed_roles = {"Moderator", "Developer", "Support", "Owner", "Streamer"}
+    author_roles = {r.name for r in ctx.author.roles}
+    is_admin = ctx.author.guild_permissions.administrator
+
+    if not is_admin and not (author_roles & allowed_roles):
+        return await ctx.send(
+            "❌ You don't have permission to use this command.",
+            delete_after=8
+        )
+
+    try:
+        await ctx.message.delete()
+    except discord.Forbidden:
+        pass
+
+    await ctx.author.send_modal(LiveKickUsernameModal()) if False else None
+
+    # Send modal via interaction — since !live is a prefix command we do it differently:
+    # We send an ephemeral prompt with a button that opens the modal
+    class OpenLiveModal(View):
+        def __init__(self):
+            super().__init__(timeout=60)
+
+        @discord.ui.button(label="🔴  Set Up Live Announcement", style=discord.ButtonStyle.success)
+        async def open_modal(self, interaction: discord.Interaction, button: Button):
+            if interaction.user.id != ctx.author.id:
+                return await interaction.response.send_message("❌ This panel isn't for you.", ephemeral=True)
+            await interaction.response.send_modal(LiveKickUsernameModal())
+
+    embed = discord.Embed(
+        title="🔴 Go Live",
+        description="Click the button below to set up your live announcement.\nYou'll enter your Kick username, pick your category, and choose where to post it.",
+        color=0x53FC18
+    )
+    embed.set_footer(text="Only visible to you")
+    await ctx.send(embed=embed, view=OpenLiveModal(), delete_after=60)
+
+
+# ==========================================================
 # KeepAlive Task & Event Handlers
-# ---------------------------------
+# ==========================================================
 @tasks.loop(minutes=30)
 async def keep_alive():
     print("[KeepAlive] Sending heartbeat ping to Discord...")
@@ -216,7 +375,6 @@ async def update_stats():
 
 @tasks.loop(seconds=30)
 async def reminder_loop():
-    """Check and fire due reminders every 30 seconds"""
     reminders = load_reminders()
     now = datetime.now(timezone.utc)
     remaining = []
@@ -239,6 +397,10 @@ async def reminder_loop():
             remaining.append(reminder)
     save_reminders(remaining)
 
+
+# -------------------------
+# BOT EVENTS
+# -------------------------
 @bot.event
 async def on_disconnect():
     print("[WARNING] Bot disconnected from Discord...")
@@ -249,13 +411,14 @@ async def on_resumed():
 
 @bot.event
 async def on_ready():
-    await bot.change_presence(activity=discord.Game(name="!help | Multi-Server Bot"))
+    await bot.change_presence(activity=discord.Game(name="DaSixBot | Hosting"))
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     print(f"Connected to {len(bot.guilds)} servers")
     keep_alive.start()
     update_stats.start()
     reminder_loop.start()
     print("[Bot] All background tasks started")
+
 
 # -------------------------
 # ANTI-SPAM & SILENT CHANNEL MESSAGE HANDLER
@@ -504,9 +667,8 @@ async def generate_transcript(channel):
 # TICKET RATING SYSTEM
 # -------------------------
 class TicketRatingView(View):
-    """Sent via DM after a ticket closes — 1 to 5 star rating"""
     def __init__(self, ticket_number, guild_name):
-        super().__init__(timeout=86400)  # 24 hour window to rate
+        super().__init__(timeout=86400)
         self.ticket_number = ticket_number
         self.guild_name = guild_name
 
@@ -519,7 +681,6 @@ class TicketRatingView(View):
                 guild_data["tickets"][ticket_key]["rated_at"] = datetime.now(timezone.utc).isoformat()
                 save_ticket_data(ticket_data)
                 break
-
         embed = discord.Embed(
             title="⭐ Thanks for your feedback!",
             description=f"You rated your support experience **{label}** for ticket **#{self.ticket_number}** in **{self.guild_name}**.\n\nYour feedback helps us improve!",
@@ -553,12 +714,12 @@ class TicketRatingView(View):
 class TicketCategorySelect(Select):
     def __init__(self):
         options = [
-            discord.SelectOption(label="💰 General Support", description="General questions and support", emoji="💰"),
-            discord.SelectOption(label="⚙️ Technical Support", description="Bot or server technical issues", emoji="⚙️"),
-            discord.SelectOption(label="👤 Account Issues", description="Verification or account problems", emoji="👤"),
-            discord.SelectOption(label="📢 Report User/Issue", description="Report a user or problem", emoji="📢"),
-            discord.SelectOption(label="💡 Suggestion", description="Suggest improvements", emoji="💡"),
-            discord.SelectOption(label="❓ General Question", description="General inquiry", emoji="❓"),
+            discord.SelectOption(label="💰 General Support",    description="General questions and support",        emoji="💰"),
+            discord.SelectOption(label="⚙️ Technical Support",  description="Bot or server technical issues",       emoji="⚙️"),
+            discord.SelectOption(label="👤 Account Issues",     description="Verification or account problems",     emoji="👤"),
+            discord.SelectOption(label="📢 Report User/Issue",  description="Report a user or problem",             emoji="📢"),
+            discord.SelectOption(label="💡 Suggestion",         description="Suggest improvements",                 emoji="💡"),
+            discord.SelectOption(label="❓ General Question",   description="General inquiry",                      emoji="❓"),
         ]
         super().__init__(
             placeholder="Select a ticket category...",
@@ -611,26 +772,20 @@ class TicketControlsView(View):
         if not interaction.user.guild_permissions.manage_messages:
             if str(interaction.user.id) not in interaction.channel.topic:
                 return await interaction.response.send_message("❌ Only staff or the ticket owner can close this.", ephemeral=True)
-
         await interaction.response.send_message("🔒 Generating transcript and closing ticket...", ephemeral=True)
-
         html_transcript = await generate_transcript(interaction.channel)
         ticket_number = interaction.channel.name.split("-")[-1]
         user_id = interaction.channel.topic.split("ID: ")[-1] if interaction.channel.topic else "Unknown"
-
-        # Record close time for stats
         ticket_data = load_ticket_data()
         guild_str = str(interaction.guild.id)
         ticket_str = f"ticket-{ticket_number}"
         closed_at_iso = datetime.now(timezone.utc).isoformat()
-
         if guild_str in ticket_data and ticket_str in ticket_data[guild_str].get("tickets", {}):
             tkt = ticket_data[guild_str]["tickets"][ticket_str]
             tkt["closed_by"] = str(interaction.user.id)
             tkt["closed_at"] = closed_at_iso
             tkt["status"] = "closed"
             save_ticket_data(ticket_data)
-
         close_embed = discord.Embed(
             title="🔒 Ticket Closed",
             description=f"**Ticket #{ticket_number}** has been closed.",
@@ -638,8 +793,7 @@ class TicketControlsView(View):
             timestamp=datetime.now(timezone.utc)
         )
         close_embed.add_field(name="Closed By", value=interaction.user.mention, inline=True)
-        close_embed.add_field(name="Channel", value=interaction.channel.name, inline=True)
-
+        close_embed.add_field(name="Channel",   value=interaction.channel.name,  inline=True)
         mod_log_channel = discord.utils.get(interaction.guild.channels, name="ticket-logs")
         if mod_log_channel:
             html_transcript.seek(0)
@@ -647,8 +801,6 @@ class TicketControlsView(View):
                 embed=close_embed,
                 file=discord.File(html_transcript, filename=f"ticket-{ticket_number}-transcript.html")
             )
-
-        # DM user transcript + rating request
         try:
             member = interaction.guild.get_member(int(user_id))
             if member:
@@ -662,8 +814,6 @@ class TicketControlsView(View):
                     embed=dm_embed,
                     file=discord.File(html_transcript, filename=f"ticket-{ticket_number}-transcript.html")
                 )
-
-                # Send rating request
                 rating_embed = discord.Embed(
                     title="⭐ How was your support experience?",
                     description=(
@@ -676,7 +826,6 @@ class TicketControlsView(View):
                 await member.send(embed=rating_embed, view=rating_view)
         except Exception as e:
             print(f"[Ticket] Could not DM user after close: {e}")
-
         await asyncio.sleep(3)
         await interaction.channel.delete()
 
@@ -722,9 +871,9 @@ class PrioritySelectView(View):
         self.message = message
         self.ticket_number = ticket_number
         options = [
-            discord.SelectOption(label="🟢 Low Priority", value="low", emoji="🟢"),
-            discord.SelectOption(label="🟡 Medium Priority", value="medium", emoji="🟡"),
-            discord.SelectOption(label="🟠 High Priority", value="high", emoji="🟠"),
+            discord.SelectOption(label="🟢 Low Priority",      value="low",      emoji="🟢"),
+            discord.SelectOption(label="🟡 Medium Priority",   value="medium",   emoji="🟡"),
+            discord.SelectOption(label="🟠 High Priority",     value="high",     emoji="🟠"),
             discord.SelectOption(label="🔴 Critical Priority", value="critical", emoji="🔴"),
         ]
         select = Select(placeholder="Choose priority level", options=options)
@@ -734,7 +883,12 @@ class PrioritySelectView(View):
     async def select_callback(self, interaction: discord.Interaction):
         priority = interaction.data["values"][0]
         embed = self.message.embeds[0]
-        priority_display = {"low": "🟢 Low", "medium": "🟡 Medium", "high": "🟠 High", "critical": "🔴 Critical"}
+        priority_display = {
+            "low":      "🟢 Low",
+            "medium":   "🟡 Medium",
+            "high":     "🟠 High",
+            "critical": "🔴 Critical"
+        }
         for i, field in enumerate(embed.fields):
             if field.name == "⚡ Priority":
                 embed.set_field_at(i, name="⚡ Priority", value=priority_display[priority], inline=True)
@@ -763,41 +917,36 @@ class ReportModal(Modal):
             if ticket.topic and str(interaction.user.id) in ticket.topic:
                 await interaction.response.send_message(f"⚠️ You already have an open ticket: {ticket.mention}", ephemeral=True)
                 return
-
         ticket_number = get_next_ticket_number(guild.id)
         category = discord.utils.get(guild.categories, name="📬 Support Tickets")
         if not category:
             category = await guild.create_category("📬 Support Tickets")
-
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(read_messages=False),
-            interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True),
-            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True, manage_messages=True)
+            interaction.user:   discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True),
+            guild.me:           discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True, manage_messages=True)
         }
         mod_role = discord.utils.get(guild.roles, name="Moderator")
         if mod_role:
             overwrites[mod_role] = discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_messages=True)
-
         ticket_channel = await guild.create_text_channel(
             f"ticket-{ticket_number}",
             category=category,
             topic=f"Ticket #{ticket_number} | User: {interaction.user.name} | ID: {interaction.user.id}",
             overwrites=overwrites
         )
-
         embed = discord.Embed(
             title=f"🎫 {self.issue_title.value}",
             description=f"**Category:** {self.category}\n**Opened By:** {interaction.user.mention} ({interaction.user.id})",
             color=discord.Color.blue(),
             timestamp=datetime.now(timezone.utc)
         )
-        embed.add_field(name="⚡ Priority", value="🟡 Medium", inline=True)
-        embed.add_field(name="📝 Status", value="🔵 Open", inline=True)
-        embed.add_field(name="🎫 Ticket Number", value=f"#{ticket_number}", inline=True)
-        embed.add_field(name="📋 Issue Details", value=f"```\n{self.issue_details.value[:500]}\n```", inline=False)
+        embed.add_field(name="⚡ Priority",       value="🟡 Medium",        inline=True)
+        embed.add_field(name="📝 Status",         value="🔵 Open",          inline=True)
+        embed.add_field(name="🎫 Ticket Number",  value=f"#{ticket_number}", inline=True)
+        embed.add_field(name="📋 Issue Details",  value=f"```\n{self.issue_details.value[:500]}\n```", inline=False)
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
         embed.set_footer(text=f"Ticket #{ticket_number} | Created")
-
         view = TicketControlsView(ticket_number)
         welcome_msg = (
             f"{interaction.user.mention} Welcome to your support ticket!\n\n"
@@ -809,21 +958,19 @@ class ReportModal(Modal):
             "**Need urgent help?** @ mention a moderator if this is critical."
         )
         await ticket_channel.send(content=welcome_msg, embed=embed, view=view)
-
         ticket_data = load_ticket_data()
         guild_str = str(guild.id)
         if guild_str not in ticket_data:
             ticket_data[guild_str] = {"counter": ticket_number, "tickets": {}}
         ticket_data[guild_str]["tickets"][f"ticket-{ticket_number}"] = {
-            "user_id": str(interaction.user.id),
-            "category": self.category,
-            "title": self.issue_title.value,
+            "user_id":    str(interaction.user.id),
+            "category":   self.category,
+            "title":      self.issue_title.value,
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "status": "open",
-            "priority": "medium"
+            "status":     "open",
+            "priority":   "medium"
         }
         save_ticket_data(ticket_data)
-
         await interaction.response.send_message(f"✅ Ticket **#{ticket_number}** created: {ticket_channel.mention}", ephemeral=True)
         if any(word in self.category.lower() for word in ["report", "critical"]):
             if mod_role:
@@ -995,11 +1142,11 @@ async def verify(ctx: commands.Context, member: discord.Member = None):
     verification_data = load_verifications()
     account_analysis = check_account_age(member)
     verification_data[str(member.id)] = {
-        "verified_at": datetime.now(timezone.utc).isoformat(),
-        "verified_by": str(ctx.author.id),
-        "manual": True,
+        "verified_at":     datetime.now(timezone.utc).isoformat(),
+        "verified_by":     str(ctx.author.id),
+        "manual":          True,
         "account_age_days": account_analysis["account_age_days"],
-        "guild_id": str(ctx.guild.id)
+        "guild_id":        str(ctx.guild.id)
     }
     save_verifications(verification_data)
     await ctx.send(f"✅ {member.mention} has been manually verified!")
@@ -1147,35 +1294,29 @@ async def ticket(ctx):
 
 
 # -------------------------
-# NEW: Ticket Stats Command
+# Ticket Stats Command
 # -------------------------
 @bot.command(name="ticket_stats")
 @commands.has_permissions(manage_messages=True)
 async def ticket_stats(ctx):
-    """Display ticket statistics for this server"""
     ticket_data = load_ticket_data()
     guild_str = str(ctx.guild.id)
-
     if guild_str not in ticket_data or not ticket_data[guild_str].get("tickets"):
         return await ctx.send("📭 No ticket data found for this server.")
-
     tickets = ticket_data[guild_str]["tickets"]
-    total = len(tickets)
-    open_count = sum(1 for t in tickets.values() if t.get("status") == "open")
+    total        = len(tickets)
+    open_count   = sum(1 for t in tickets.values() if t.get("status") == "open")
     closed_count = sum(1 for t in tickets.values() if t.get("status") == "closed")
-
-    # Average close time
     close_times = []
     for t in tickets.values():
         if t.get("created_at") and t.get("closed_at"):
             try:
                 created = datetime.fromisoformat(t["created_at"])
-                closed = datetime.fromisoformat(t["closed_at"])
-                diff = (closed - created).total_seconds() / 60  # in minutes
+                closed  = datetime.fromisoformat(t["closed_at"])
+                diff = (closed - created).total_seconds() / 60
                 close_times.append(diff)
             except:
                 pass
-
     avg_close_str = "N/A"
     if close_times:
         avg_minutes = sum(close_times) / len(close_times)
@@ -1185,37 +1326,30 @@ async def ticket_stats(ctx):
             avg_close_str = f"{avg_minutes / 60:.1f} hours"
         else:
             avg_close_str = f"{avg_minutes / 1440:.1f} days"
-
-    # Ratings
     ratings = [t["rating"] for t in tickets.values() if t.get("rating")]
     avg_rating_str = "No ratings yet"
     if ratings:
         avg = sum(ratings) / len(ratings)
         avg_rating_str = f"{'⭐' * round(avg)} ({avg:.1f}/5 from {len(ratings)} ratings)"
-
-    # Category breakdown
     categories = defaultdict(int)
     for t in tickets.values():
         cat = t.get("category", "Unknown")
         categories[cat] += 1
     top_categories = sorted(categories.items(), key=lambda x: x[1], reverse=True)[:3]
-
     embed = discord.Embed(
         title="📊 Ticket Statistics",
         description=f"Support ticket overview for **{ctx.guild.name}**",
         color=discord.Color.blurple(),
         timestamp=datetime.now(timezone.utc)
     )
-    embed.add_field(name="🎫 Total Tickets", value=str(total), inline=True)
-    embed.add_field(name="🔵 Open", value=str(open_count), inline=True)
-    embed.add_field(name="🔒 Closed", value=str(closed_count), inline=True)
-    embed.add_field(name="⏱️ Avg Close Time", value=avg_close_str, inline=True)
-    embed.add_field(name="⭐ Avg Rating", value=avg_rating_str, inline=False)
-
+    embed.add_field(name="🎫 Total Tickets", value=str(total),        inline=True)
+    embed.add_field(name="🔵 Open",          value=str(open_count),   inline=True)
+    embed.add_field(name="🔒 Closed",        value=str(closed_count), inline=True)
+    embed.add_field(name="⏱️ Avg Close Time", value=avg_close_str,    inline=True)
+    embed.add_field(name="⭐ Avg Rating",     value=avg_rating_str,   inline=False)
     if top_categories:
         cat_text = "\n".join([f"• {cat}: **{count}**" for cat, count in top_categories])
         embed.add_field(name="📋 Top Categories", value=cat_text, inline=False)
-
     embed.set_footer(text=f"Requested by {ctx.author.display_name}")
     await ctx.send(embed=embed)
 
@@ -1288,11 +1422,11 @@ async def spam_config(ctx, messages: int = None, interval: int = None, timeout: 
     if messages < 1 or interval < 1 or timeout < 1:
         return await ctx.send("❌ All values must be greater than 0.")
     anti_spam.messages_per_interval = messages
-    anti_spam.interval_seconds = interval
-    anti_spam.timeout_seconds = timeout
+    anti_spam.interval_seconds      = interval
+    anti_spam.timeout_seconds       = timeout
     embed = discord.Embed(title="✅ Anti-Spam Configuration Updated", color=discord.Color.green())
-    embed.add_field(name="Max Messages", value=str(messages), inline=True)
-    embed.add_field(name="Time Window", value=f"{interval}s", inline=True)
+    embed.add_field(name="Max Messages",  value=str(messages),                   inline=True)
+    embed.add_field(name="Time Window",   value=f"{interval}s",                  inline=True)
     embed.add_field(name="Mute Duration", value=f"{timeout}s ({timeout // 60}m)", inline=True)
     await ctx.send(embed=embed)
 
@@ -1369,7 +1503,6 @@ async def announcement(ctx):
         timestamp=datetime.now(timezone.utc)
     )
     embed.set_footer(text=f"Sent by {ctx.author.display_name}", icon_url=ctx.author.display_avatar.url)
-
     config = load_server_config(ctx.guild.id)
     announcement_channel_id = config.get("announcement_channel_id")
     if announcement_channel_id:
@@ -1392,14 +1525,21 @@ async def announcement(ctx):
 async def setup(ctx):
     embed = discord.Embed(
         title="⚙️ Server Setup",
-        description="Let's configure the bot for your server!\n\n**You'll need the IDs for your role and channels.**\nEnable Developer Mode in Discord settings to copy IDs.",
+        description=(
+            "Let's configure the bot for your server!\n\n"
+            "**You'll need the IDs for your role and channels.**\n"
+            "Enable Developer Mode in Discord settings to copy IDs.\n\n"
+            "Type `skip` at any step to leave it unchanged."
+        ),
         color=discord.Color.blue()
     )
     await ctx.send(embed=embed)
     config = load_server_config(ctx.guild.id)
+
     def check(m):
         return m.author == ctx.author and m.channel == ctx.channel
 
+    # Step 1: Verified role
     await ctx.send("🔐 **Step 1:** Paste the **Role ID** for the verified role, or type `skip`:")
     try:
         msg = await bot.wait_for("message", check=check, timeout=60)
@@ -1411,12 +1551,13 @@ async def setup(ctx):
                     config["verified_role_id"] = role_id
                     await ctx.send(f"✅ Verified role set to **{role.name}**")
                 else:
-                    await ctx.send(f"⚠️ No role found with that ID. Skipping.")
+                    await ctx.send("⚠️ No role found with that ID. Skipping.")
             except ValueError:
                 await ctx.send("⚠️ Invalid ID. Skipping.")
     except asyncio.TimeoutError:
         await ctx.send("⏱️ Timeout, skipping...")
 
+    # Step 2: Announcement channel
     await ctx.send("📢 **Step 2:** Paste the **Channel ID** for announcements, or type `skip`:")
     try:
         msg = await bot.wait_for("message", check=check, timeout=60)
@@ -1428,12 +1569,13 @@ async def setup(ctx):
                     config["announcement_channel_id"] = channel_id
                     await ctx.send(f"✅ Announcement channel set to **{channel.name}**")
                 else:
-                    await ctx.send(f"⚠️ No channel found with that ID. Skipping.")
+                    await ctx.send("⚠️ No channel found with that ID. Skipping.")
             except ValueError:
                 await ctx.send("⚠️ Invalid ID. Skipping.")
     except asyncio.TimeoutError:
         await ctx.send("⏱️ Timeout, skipping...")
 
+    # Step 3: Stats channel
     await ctx.send("📊 **Step 3:** Paste the **Channel ID** for member count stats, or type `skip`:")
     try:
         msg = await bot.wait_for("message", check=check, timeout=60)
@@ -1445,7 +1587,7 @@ async def setup(ctx):
                     config["stats_channel_id"] = channel_id
                     await ctx.send(f"✅ Stats channel set to **{channel.name}**")
                 else:
-                    await ctx.send(f"⚠️ No channel found with that ID. Skipping.")
+                    await ctx.send("⚠️ No channel found with that ID. Skipping.")
             except ValueError:
                 await ctx.send("⚠️ Invalid ID. Skipping.")
     except asyncio.TimeoutError:
@@ -1472,155 +1614,112 @@ async def setup(ctx):
 
 
 # -------------------------
-# NEW: User Info Command
+# User Info Command
 # -------------------------
 @bot.command(name="userinfo")
 async def userinfo(ctx, member: discord.Member = None):
-    """Display detailed info about a member"""
     if member is None:
         member = ctx.author
-
     now = datetime.now(timezone.utc)
     account_age_days = (now - member.created_at).days
-    join_age_days = (now - member.joined_at).days if member.joined_at else 0
-
-    # Check verification status from file
+    join_age_days    = (now - member.joined_at).days if member.joined_at else 0
     verification_data = load_verifications()
     user_verification = verification_data.get(str(member.id))
-
     if user_verification:
-        verified_at = datetime.fromisoformat(user_verification["verified_at"])
+        verified_at   = datetime.fromisoformat(user_verification["verified_at"])
         verify_status = f"✅ Verified <t:{int(verified_at.timestamp())}:R>"
-        risk_level = user_verification.get("risk_level", "unknown")
+        risk_level    = user_verification.get("risk_level", "unknown")
         verify_method = user_verification.get("method", "unknown")
     else:
         verify_status = "❌ Not Verified"
-        risk_level = "N/A"
+        risk_level    = "N/A"
         verify_method = "N/A"
-
-    # Roles (exclude @everyone)
     roles = [r.mention for r in reversed(member.roles) if r.name != "@everyone"]
     roles_str = " ".join(roles) if roles else "No roles"
     if len(roles_str) > 1000:
         roles_str = f"{len(roles)} roles"
-
     embed = discord.Embed(
         title=f"👤 User Info — {member.display_name}",
         color=member.color if member.color != discord.Color.default() else discord.Color.blurple(),
         timestamp=now
     )
     embed.set_thumbnail(url=member.display_avatar.url)
-
-    embed.add_field(name="🪪 Username", value=str(member), inline=True)
-    embed.add_field(name="🆔 User ID", value=str(member.id), inline=True)
-    embed.add_field(name="🤖 Bot?", value="Yes" if member.bot else "No", inline=True)
-
-    embed.add_field(
-        name="📅 Account Created",
-        value=f"<t:{int(member.created_at.timestamp())}:F>\n({account_age_days} days ago)",
-        inline=True
-    )
-    embed.add_field(
-        name="📥 Joined Server",
-        value=f"<t:{int(member.joined_at.timestamp())}:F>\n({join_age_days} days ago)" if member.joined_at else "Unknown",
-        inline=True
-    )
-    embed.add_field(name="🖼️ Avatar", value="Custom" if member.avatar else "Default", inline=True)
-
-    embed.add_field(name="🔐 Verification Status", value=verify_status, inline=True)
-    embed.add_field(name="🛡️ Risk Level", value=risk_level.capitalize(), inline=True)
-    embed.add_field(name="🔑 Verify Method", value=verify_method.replace("_", " ").title(), inline=True)
-
-    embed.add_field(name=f"🏷️ Roles ({len(roles)})", value=roles_str, inline=False)
-
+    embed.add_field(name="🪪 Username",        value=str(member),                              inline=True)
+    embed.add_field(name="🆔 User ID",         value=str(member.id),                           inline=True)
+    embed.add_field(name="🤖 Bot?",            value="Yes" if member.bot else "No",             inline=True)
+    embed.add_field(name="📅 Account Created", value=f"<t:{int(member.created_at.timestamp())}:F>\n({account_age_days} days ago)", inline=True)
+    embed.add_field(name="📥 Joined Server",   value=f"<t:{int(member.joined_at.timestamp())}:F>\n({join_age_days} days ago)" if member.joined_at else "Unknown", inline=True)
+    embed.add_field(name="🖼️ Avatar",          value="Custom" if member.avatar else "Default",  inline=True)
+    embed.add_field(name="🔐 Verification Status", value=verify_status,                        inline=True)
+    embed.add_field(name="🛡️ Risk Level",      value=risk_level.capitalize(),                  inline=True)
+    embed.add_field(name="🔑 Verify Method",   value=verify_method.replace("_", " ").title(),  inline=True)
+    embed.add_field(name=f"🏷️ Roles ({len(roles)})", value=roles_str,                         inline=False)
     embed.set_footer(text=f"Requested by {ctx.author.display_name}")
     await ctx.send(embed=embed)
 
 
 # -------------------------
-# NEW: Server Info Command
+# Server Info Command
 # -------------------------
 @bot.command(name="serverinfo")
 async def serverinfo(ctx):
-    """Display server statistics and info"""
     guild = ctx.guild
     now = datetime.now(timezone.utc)
     age_days = (now - guild.created_at).days
-
-    # Member counts
-    total = guild.member_count
-    bots = sum(1 for m in guild.members if m.bot)
+    total  = guild.member_count
+    bots   = sum(1 for m in guild.members if m.bot)
     humans = total - bots
-    online = sum(1 for m in guild.members if m.status != discord.Status.offline) if hasattr(guild, 'members') else "N/A"
-
-    # Channel counts
-    text_channels = len(guild.text_channels)
+    text_channels  = len(guild.text_channels)
     voice_channels = len(guild.voice_channels)
-    categories = len(guild.categories)
-
-    # Boost info
-    boost_level = guild.premium_tier
-    boost_count = guild.premium_subscription_count or 0
-
+    categories     = len(guild.categories)
+    boost_level    = guild.premium_tier
+    boost_count    = guild.premium_subscription_count or 0
     embed = discord.Embed(
         title=f"🏠 {guild.name}",
         description=guild.description or "No description set.",
         color=discord.Color.blurple(),
         timestamp=now
     )
-
-    if guild.icon:
-        embed.set_thumbnail(url=guild.icon.url)
-    if guild.banner:
-        embed.set_image(url=guild.banner.url)
-
-    embed.add_field(name="🆔 Server ID", value=str(guild.id), inline=True)
-    embed.add_field(name="👑 Owner", value=guild.owner.mention if guild.owner else "Unknown", inline=True)
-    embed.add_field(name="📅 Created", value=f"<t:{int(guild.created_at.timestamp())}:F>\n({age_days} days ago)", inline=True)
-
-    embed.add_field(name="👥 Members", value=f"Total: **{total}**\nHumans: **{humans}**\nBots: **{bots}**", inline=True)
-    embed.add_field(name="💬 Channels", value=f"Text: **{text_channels}**\nVoice: **{voice_channels}**\nCategories: **{categories}**", inline=True)
-    embed.add_field(name="🎭 Roles", value=str(len(guild.roles)), inline=True)
-
-    embed.add_field(name="🚀 Boost Level", value=f"Level **{boost_level}**", inline=True)
-    embed.add_field(name="💎 Boosts", value=str(boost_count), inline=True)
-    embed.add_field(name="😀 Emojis", value=f"{len(guild.emojis)}/{guild.emoji_limit}", inline=True)
-
+    if guild.icon:   embed.set_thumbnail(url=guild.icon.url)
+    if guild.banner: embed.set_image(url=guild.banner.url)
+    embed.add_field(name="🆔 Server ID",  value=str(guild.id),                                              inline=True)
+    embed.add_field(name="👑 Owner",      value=guild.owner.mention if guild.owner else "Unknown",          inline=True)
+    embed.add_field(name="📅 Created",    value=f"<t:{int(guild.created_at.timestamp())}:F>\n({age_days} days ago)", inline=True)
+    embed.add_field(name="👥 Members",    value=f"Total: **{total}**\nHumans: **{humans}**\nBots: **{bots}**", inline=True)
+    embed.add_field(name="💬 Channels",   value=f"Text: **{text_channels}**\nVoice: **{voice_channels}**\nCategories: **{categories}**", inline=True)
+    embed.add_field(name="🎭 Roles",      value=str(len(guild.roles)),                                      inline=True)
+    embed.add_field(name="🚀 Boost Level",value=f"Level **{boost_level}**",                                inline=True)
+    embed.add_field(name="💎 Boosts",     value=str(boost_count),                                          inline=True)
+    embed.add_field(name="😀 Emojis",     value=f"{len(guild.emojis)}/{guild.emoji_limit}",                inline=True)
     embed.add_field(name="🔒 Verification Level", value=str(guild.verification_level).replace("_", " ").title(), inline=True)
-    embed.add_field(name="🌍 Region", value="Automatic (Discord)", inline=True)
-
+    embed.add_field(name="🌍 Region",     value="Automatic (Discord)",                                      inline=True)
     embed.set_footer(text=f"Requested by {ctx.author.display_name}")
     await ctx.send(embed=embed)
 
 
 # -------------------------
-# NEW: Remind Me Command
+# Remind Me Command
 # -------------------------
 @bot.command(name="remindme")
 async def remindme(ctx, time_str: str, *, message: str):
-    """Set a personal reminder. Example: !remindme 1h30m Check the oven"""
     seconds = convert_time(time_str)
     if seconds == 0:
         return await ctx.send("❌ Invalid time format. Examples: `30s`, `10m`, `2h`, `1d`, `1h30m`")
-
     if seconds < 10:
         return await ctx.send("❌ Minimum reminder time is 10 seconds.")
-    if seconds > 2592000:  # 30 days
+    if seconds > 2592000:
         return await ctx.send("❌ Maximum reminder time is 30 days.")
-
-    due_time = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+    due_time  = datetime.now(timezone.utc) + timedelta(seconds=seconds)
     timestamp = int(due_time.timestamp())
-
     reminders = load_reminders()
     reminders.append({
-        "user_id": ctx.author.id,
-        "message": message,
-        "due": due_time.isoformat(),
-        "set_at": datetime.now(timezone.utc).isoformat(),
+        "user_id":    ctx.author.id,
+        "message":    message,
+        "due":        due_time.isoformat(),
+        "set_at":     datetime.now(timezone.utc).isoformat(),
         "channel_id": ctx.channel.id
     })
     save_reminders(reminders)
-
     embed = discord.Embed(
         title="⏰ Reminder Set!",
         description=f"I'll remind you via DM at <t:{timestamp}:F> (<t:{timestamp}:R>).",
@@ -1631,146 +1730,237 @@ async def remindme(ctx, time_str: str, *, message: str):
     await ctx.send(embed=embed)
 
 
-# -------------------------
-# Giveaway System
-# -------------------------
-def convert_time(time_str):
-    """Converts 1h, 30m, 10s into seconds"""
-    time_regex = re.compile(r"(\d+)([smhd])")
-    matches = time_regex.findall(time_str)
-    total_seconds = 0
-    for value, unit in matches:
-        if unit == "s": total_seconds += int(value)
-        elif unit == "m": total_seconds += int(value) * 60
-        elif unit == "h": total_seconds += int(value) * 3600
-        elif unit == "d": total_seconds += int(value) * 86400
-    return total_seconds
+# =========================================================
+# GIVEAWAY SYSTEM
+# =========================================================
+def has_giveaway_permission(ctx: commands.Context) -> bool:
+    if ctx.author.guild_permissions.administrator:
+        return True
+    author_role_names = {r.name for r in ctx.author.roles}
+    return bool(author_role_names & set(GIVEAWAY_ALLOWED_ROLES))
+
+
+class GiveawayModal(Modal, title="🎉 Start a Giveaway"):
+    duration_input = TextInput(
+        label="Duration",
+        placeholder="e.g. 10s  /  30m  /  2h  /  1d",
+        max_length=20,
+        style=discord.TextStyle.short
+    )
+    winners_input = TextInput(
+        label="Number of Winners",
+        placeholder="e.g. 1",
+        max_length=3,
+        style=discord.TextStyle.short
+    )
+    prize_input = TextInput(
+        label="Prize",
+        placeholder="What are you giving away?",
+        max_length=200,
+        style=discord.TextStyle.short
+    )
+
+    def __init__(self, ctx: commands.Context):
+        super().__init__()
+        self._ctx = ctx
+
+    async def on_submit(self, interaction: discord.Interaction):
+        seconds = convert_time(self.duration_input.value.strip())
+        if seconds == 0:
+            return await interaction.response.send_message(
+                "❌ Invalid duration. Examples: `10s`, `30m`, `2h`, `1d`", ephemeral=True
+            )
+        try:
+            winners = int(self.winners_input.value.strip())
+            if winners < 1:
+                raise ValueError
+        except ValueError:
+            return await interaction.response.send_message(
+                "❌ Winner count must be a positive whole number.", ephemeral=True
+            )
+        prize = self.prize_input.value.strip()
+        await interaction.response.send_message(
+            f"✅ Giveaway for **{prize}** started! Good luck everyone 🎉",
+            ephemeral=True
+        )
+        end_time  = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+        timestamp = int(end_time.timestamp())
+        embed = discord.Embed(
+            title="🎉 **GIVEAWAY** 🎉",
+            description=(
+                f"**Prize:** {prize}\n"
+                f"**Winners:** {winners}\n"
+                f"**Hosted by:** {interaction.user.mention}\n\n"
+                f"⏳ Ends: <t:{timestamp}:R> (<t:{timestamp}:F>)"
+            ),
+            color=discord.Color.gold()
+        )
+        embed.set_footer(text="React with 🎉 to enter!")
+        channel = self._ctx.channel
+        msg = await channel.send(embed=embed)
+        await msg.add_reaction("🎉")
+        await asyncio.sleep(seconds)
+        new_msg = await channel.fetch_message(msg.id)
+        users: list[discord.User] = []
+        async for user in new_msg.reactions[0].users():
+            if not user.bot:
+                users.append(user)
+        if len(users) < winners:
+            await channel.send("❌ Not enough entrants to determine a winner.")
+            embed.description += "\n\n❌ **Giveaway ended — not enough entries.**"
+            embed.color = discord.Color.red()
+            embed.set_footer(text="Giveaway Ended")
+            await msg.edit(embed=embed)
+            return
+        won_users       = random.sample(users, winners)
+        winners_mention = ", ".join(u.mention for u in won_users)
+        await channel.send(f"🎉 **CONGRATULATIONS** {winners_mention}! You won **{prize}**!")
+        embed.description += f"\n\n🏆 **Winner:** {winners_mention}"
+        embed.color = discord.Color.green()
+        embed.set_footer(text="Giveaway Ended")
+        await msg.edit(embed=embed)
+
+
+class GiveawayLaunchView(View):
+    def __init__(self, ctx: commands.Context):
+        super().__init__(timeout=120)
+        self._ctx = ctx
+
+    @discord.ui.button(label="🎉 Configure Giveaway", style=discord.ButtonStyle.success)
+    async def open_modal(self, interaction: discord.Interaction, button: Button):
+        if interaction.user.id != self._ctx.author.id:
+            return await interaction.response.send_message("❌ This is not your giveaway panel.", ephemeral=True)
+        await interaction.response.send_modal(GiveawayModal(self._ctx))
 
 
 @bot.command(name="gstart")
-@commands.has_permissions(administrator=True)
-async def gstart(ctx, duration: str, winners: int, *, prize: str):
-    await ctx.message.delete()
-    seconds = convert_time(duration)
-    if seconds == 0:
-        return await ctx.send("❌ Invalid time format. Use 10s, 30m, 1h, 1d.", delete_after=10)
-    end_time = datetime.now(timezone.utc) + timedelta(seconds=seconds)
-    timestamp = int(end_time.timestamp())
+async def gstart(ctx: commands.Context):
+    """Start a giveaway — available to Moderator, Developer, Support, Owner, or Admins."""
+    if not has_giveaway_permission(ctx):
+        return await ctx.send(
+            f"❌ You need one of these roles to start a giveaway: "
+            f"{', '.join(f'**{r}**' for r in GIVEAWAY_ALLOWED_ROLES)} (or Administrator).",
+            delete_after=10
+        )
+    try:
+        await ctx.message.delete()
+    except discord.Forbidden:
+        pass
     embed = discord.Embed(
-        title="🎉 **GIVEAWAY** 🎉",
+        title="🎉 Giveaway Setup",
         description=(
-            f"**Prize:** {prize}\n"
-            f"**Winners:** {winners}\n"
-            f"**Hosted by:** {ctx.author.mention}\n\n"
-            f"⏳ Ends: <t:{timestamp}:R> (<t:{timestamp}:F>)"
+            "Click **Configure Giveaway** to fill in the details.\n\n"
+            "You'll be asked for:\n"
+            "• **Duration** — how long the giveaway runs\n"
+            "• **Winners** — how many people win\n"
+            "• **Prize** — what you're giving away"
         ),
         color=discord.Color.gold()
     )
-    embed.set_footer(text="React with 🎉 to enter!")
-    msg = await ctx.send(embed=embed)
-    await msg.add_reaction("🎉")
-    await asyncio.sleep(seconds)
-    new_msg = await ctx.channel.fetch_message(msg.id)
-    users = []
-    async for user in new_msg.reactions[0].users():
-        if not user.bot:
-            users.append(user)
-    if len(users) < winners:
-        return await ctx.send("❌ Not enough entrants to determine a winner.")
-    won_users = random.sample(users, winners)
-    winners_mention = ", ".join([user.mention for user in won_users])
-    await ctx.send(f"🎉 **CONGRATULATIONS** {winners_mention}! You won **{prize}**!")
-    embed.description += f"\n\n🏆 **Winner:** {winners_mention}"
-    embed.color = discord.Color.green()
-    embed.set_footer(text="Giveaway Ended")
-    await msg.edit(embed=embed)
+    embed.set_footer(text=f"Started by {ctx.author.display_name}")
+    view = GiveawayLaunchView(ctx)
+    await ctx.send(embed=embed, view=view, delete_after=120)
 
 
-# -------------------------
+# =========================================================
 # Fun Commands
-# -------------------------
+# =========================================================
 @bot.command(name="flip")
 async def flip(ctx):
     choices = ["Heads", "Tails"]
-    result = random.choice(choices)
-    embed = discord.Embed(title="🪙 Coin Flip", color=discord.Color.gold())
+    result  = random.choice(choices)
     msg = await ctx.send(embed=discord.Embed(title="🪙 Flipping...", color=discord.Color.light_grey()))
     await asyncio.sleep(1)
-    embed.description = f"**{result.upper()}**"
+    embed = discord.Embed(title="🪙 Coin Flip", description=f"**{result.upper()}**", color=discord.Color.gold())
     await msg.edit(embed=embed)
 
 
-# -------------------------
-# UPDATED Help Command (all pages)
-# -------------------------
+# =========================================================
+# Help Command
+# =========================================================
 @bot.command(name="help")
 async def help_command(ctx):
     embeds = []
 
-    # Page 1: Basic Commands
-    embed1 = discord.Embed(title="🤖 Bot Commands — Page 1/5", color=discord.Color.blurple())
-    embed1.add_field(name="**BASIC COMMANDS**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    embed1.add_field(name="!help", value="Display this help message", inline=False)
-    embed1.add_field(name="!rules", value="Display server rules", inline=False)
-    embed1.add_field(name="!ticket", value="Create a support ticket", inline=False)
-    embed1.add_field(name="!gstart <time> <winners> <prize>", value="Start a giveaway (Admin)", inline=False)
-    embed1.add_field(name="!flip", value="Flip a coin", inline=False)
-    embeds.append(embed1)
+    # Page 1 — Basic
+    e1 = discord.Embed(title="🤖 Bot Commands — Page 1/5", color=discord.Color.blurple())
+    e1.add_field(name="**BASIC COMMANDS**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    e1.add_field(name="!help",      value="Display this help message",                           inline=False)
+    e1.add_field(name="!rules",     value="Display server rules",                                inline=False)
+    e1.add_field(name="!ticket",    value="Create a support ticket",                             inline=False)
+    e1.add_field(name="!gstart",    value="Start a giveaway via interactive menu (Moderator+)",  inline=False)
+    e1.add_field(name="!flip",      value="Flip a coin",                                         inline=False)
+    embeds.append(e1)
 
-    # Page 2: Anti-Spam & Silent Channels
-    embed2 = discord.Embed(title="🛡️ Bot Commands — Page 2/5", color=discord.Color.orange())
-    embed2.add_field(name="**ANTI-SPAM COMMANDS (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    embed2.add_field(name="!spam_info", value="Display anti-spam settings and muted users", inline=False)
-    embed2.add_field(name="!unmute_user <member>", value="Manually unmute a user", inline=False)
-    embed2.add_field(name="!spam_config <msgs> <interval> <timeout>", value="Configure anti-spam thresholds", inline=False)
-    embed2.add_field(name="**SILENT CHANNEL COMMANDS (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    embed2.add_field(name="!silent_channels", value="View all channels with silent mode enabled", inline=False)
-    embed2.add_field(name="!enable_silent [channel]", value="Enable silent mode for a channel", inline=False)
-    embed2.add_field(name="!disable_silent [channel]", value="Disable silent mode for a channel", inline=False)
-    embeds.append(embed2)
+    # Page 2 — Live Announcement
+    e2 = discord.Embed(title="🔴 Bot Commands — Page 2/5", color=0x53FC18)
+    e2.add_field(name="**KICK LIVE ANNOUNCEMENT**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    e2.add_field(
+        name="!live",
+        value=(
+            "Opens an interactive live announcement menu.\n\n"
+            "**Step 1 —** Enter your Kick.com username\n"
+            "**Step 2 —** Select your stream category from the dropdown\n"
+            "**Step 3 —** Choose which Discord channel to post the notification in\n\n"
+            "The bot will post a clean @everyone live notification with your stream link.\n\n"
+            "**Who can use it:** Moderator, Developer, Support, Owner, Streamer roles + Admins"
+        ),
+        inline=False
+    )
+    embeds.append(e2)
 
-    # Page 3: Payment & Verification
-    embed3 = discord.Embed(title="💰 Bot Commands — Page 3/5", color=discord.Color.green())
-    embed3.add_field(name="**PAYMENT TRACKING (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    embed3.add_field(name="!pay <username> <amount>", value="Record a payment (subtracts from balance)", inline=False)
-    embed3.add_field(name="!pay_add <username> <amount>", value="Add an amount owed to a user", inline=False)
-    embed3.add_field(name="!pay_remove <username>", value="Remove a user from the tracker", inline=False)
-    embed3.add_field(name="!pay_list", value="Display all current payment balances", inline=False)
-    embed3.add_field(name="!pay_reset", value="Reset all payment data (requires confirmation)", inline=False)
-    embed3.add_field(name="**VERIFICATION (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    embed3.add_field(name="!verify [member]", value="Manually verify a member", inline=False)
-    embed3.add_field(name="!sendverify", value="Send the verification button embed", inline=False)
-    embeds.append(embed3)
+    # Page 3 — Anti-Spam & Silent
+    e3 = discord.Embed(title="🛡️ Bot Commands — Page 3/5", color=discord.Color.orange())
+    e3.add_field(name="**ANTI-SPAM COMMANDS (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    e3.add_field(name="!spam_info",                               value="Display anti-spam settings and muted users",  inline=False)
+    e3.add_field(name="!unmute_user <member>",                    value="Manually unmute a user",                      inline=False)
+    e3.add_field(name="!spam_config <msgs> <interval> <timeout>", value="Configure anti-spam thresholds",              inline=False)
+    e3.add_field(name="**SILENT CHANNEL COMMANDS (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    e3.add_field(name="!silent_channels",         value="View all channels with silent mode enabled", inline=False)
+    e3.add_field(name="!enable_silent [channel]",  value="Enable silent mode for a channel",          inline=False)
+    e3.add_field(name="!disable_silent [channel]", value="Disable silent mode for a channel",         inline=False)
+    embeds.append(e3)
 
-    # Page 4: Utility (NEW)
-    embed4 = discord.Embed(title="📊 Bot Commands — Page 4/5", color=discord.Color.teal())
-    embed4.add_field(name="**UTILITY COMMANDS**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    embed4.add_field(name="!userinfo [member]", value="Show detailed info about a member — join date, roles, account age, verification status", inline=False)
-    embed4.add_field(name="!serverinfo", value="Show server stats — member count, channels, boosts, creation date and more", inline=False)
-    embed4.add_field(name="!remindme <time> <message>", value="Set a personal reminder delivered via DM\nExamples: `!remindme 30m Check oven` / `!remindme 1h30m Meeting`", inline=False)
-    embed4.add_field(name="**TICKET TOOLS (Staff)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    embed4.add_field(name="!ticket_stats", value="View ticket statistics — total, open/closed count, avg close time, avg rating and top categories", inline=False)
-    embed4.add_field(name="⭐ Ticket Rating", value="When a ticket closes, the user is automatically sent a 1–5 star rating request via DM", inline=False)
-    embeds.append(embed4)
+    # Page 4 — Payments & Verification
+    e4 = discord.Embed(title="💰 Bot Commands — Page 4/5", color=discord.Color.green())
+    e4.add_field(name="**PAYMENT TRACKING (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    e4.add_field(name="!pay <username> <amount>",     value="Record a payment (subtracts from balance)", inline=False)
+    e4.add_field(name="!pay_add <username> <amount>", value="Add an amount owed to a user",              inline=False)
+    e4.add_field(name="!pay_remove <username>",       value="Remove a user from the tracker",            inline=False)
+    e4.add_field(name="!pay_list",                    value="Display all current payment balances",      inline=False)
+    e4.add_field(name="!pay_reset",                   value="Reset all payment data (requires confirmation)", inline=False)
+    e4.add_field(name="**VERIFICATION (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    e4.add_field(name="!verify [member]", value="Manually verify a member",          inline=False)
+    e4.add_field(name="!sendverify",      value="Send the verification button embed", inline=False)
+    embeds.append(e4)
 
-    # Page 5: Server Management
-    embed5 = discord.Embed(title="⚙️ Bot Commands — Page 5/5", color=discord.Color.red())
-    embed5.add_field(name="**SERVER MANAGEMENT (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    embed5.add_field(name="!setup", value="Interactive server configuration wizard", inline=False)
-    embed5.add_field(name="!delete <number>", value="Bulk delete messages from a channel", inline=False)
-    embed5.add_field(name="!announcement", value="Create and send a server announcement", inline=False)
-    embed5.add_field(name="**SUPPORT**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    embed5.add_field(name="Support Server", value="[Join our support server](https://discord.gg/PMDtKbUfEA)", inline=False)
-    embed5.add_field(name="Invite Bot", value="[Invite this bot to your server](https://discord.com/oauth2/authorize?client_id=YOUR_BOT_ID&permissions=8&scope=bot)", inline=False)
-    embeds.append(embed5)
+    # Page 5 — Utility & Management
+    e5 = discord.Embed(title="📊 Bot Commands — Page 5/5", color=discord.Color.teal())
+    e5.add_field(name="**UTILITY COMMANDS**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    e5.add_field(name="!userinfo [member]",
+                 value="Show detailed info about a member — join date, roles, account age, verification status", inline=False)
+    e5.add_field(name="!serverinfo",
+                 value="Show server stats — member count, channels, boosts, creation date and more", inline=False)
+    e5.add_field(name="!remindme <time> <message>",
+                 value="Set a personal reminder delivered via DM\nExamples: `!remindme 30m Check oven` / `!remindme 1h30m Meeting`", inline=False)
+    e5.add_field(name="**TICKET TOOLS (Staff)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    e5.add_field(name="!ticket_stats",
+                 value="View ticket statistics — total, open/closed count, avg close time, avg rating and top categories", inline=False)
+    e5.add_field(name="**SERVER MANAGEMENT (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    e5.add_field(name="!setup",           value="Interactive server configuration wizard", inline=False)
+    e5.add_field(name="!delete <number>", value="Bulk delete messages from a channel",    inline=False)
+    e5.add_field(name="!announcement",    value="Create and send a server announcement",  inline=False)
+    e5.add_field(name="**SUPPORT**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    e5.add_field(name="Support Server", value="[Join our support server](https://discord.gg/PMDtKbUfEA)", inline=False)
+    embeds.append(e5)
 
     for embed in embeds:
         await ctx.send(embed=embed)
 
 
-# -------------------------
+# =========================================================
 # Run the bot
-# -------------------------
+# =========================================================
 if __name__ == "__main__":
     TOKEN = os.getenv("DISCORD_BOT_TOKEN")
     if not TOKEN:
