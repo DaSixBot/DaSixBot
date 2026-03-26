@@ -89,18 +89,47 @@ Professional Discord bot hosting with full setup and management included. No tec
 - Silent channels for announcement control
 - Bulk message deletion
 
+#### 🔇 Temp-Mute / Temp-Ban
+- `!mute @user 10m Spamming` — automatically creates a `Muted` role with proper channel overwrites, stores active mutes in `tempmutes.json`, and auto-lifts them via a background task running every 15 seconds
+- `!unmute @user` — manually lifts a mute before its timer expires
+- `!tempban @user 1d Breaking rules` — bans the user and automatically unbans them after the specified duration using an async background task
+- All punishments DM the user with the duration and reason
+
+### 🖼️ **Welcome Image System**
+- Generates a custom banner for each new member using Pillow — includes their circular avatar, username, member count, and server name
+- Posts automatically to the welcome channel configured in `!setup` (Step 4: Welcome Channel)
+- Gracefully falls back if Pillow is not installed or fonts are unavailable
+
+### 💤 **AFK System**
+- `!afk [reason]` — marks you as AFK and appends `[AFK]` to your nickname
+- When another member pings an AFK user, the bot replies with their reason and how long they've been away
+- AFK status is automatically removed the moment you send any message
+
+### 📋 **Custom Commands**
+- `!addcmd <trigger> <response>` — e.g. `!addcmd discord Join us at discord.gg/example` creates a `!discord` command anyone can use
+- `!removecmd <trigger>` — deletes a custom command
+- `!listcmds` — displays all active custom commands for the server
+- Built-in bot commands are protected and cannot be overridden
+
+### ⏱️ **Uptime**
+- `!uptime` — displays how long the bot has been online, the exact start time, and current gateway latency
+
 ### 🎫 **Support Ticket System**
 - Categorized support tickets with priorities
 - Automatic HTML transcripts
 - Ticket claiming and user management
 - Professional ticket interface
-- **NEW: 1–5 star rating system** — users are automatically sent a rating request via DM when their ticket closes
-- **NEW: `!ticket_stats`** — staff can view total tickets, open/closed counts, average close time, average rating, and top categories
+- **Ticket Templates** — each category automatically sends a pre-filled question embed inside the ticket upon opening:
+  - **Report** — asks for username, what they did, and evidence
+  - **Technical** — asks for OS, error message, and steps already tried
+  - Additional categories follow the same structured format
+- **1–5 star rating system** — users are automatically sent a rating request via DM when their ticket closes
+- **`!ticket_stats`** — staff can view total tickets, open/closed counts, average close time, average rating, and top categories
 
 ### 📊 **Utility Commands**
-- **NEW: `!userinfo [member]`** — displays join date, account age, roles, avatar type, and full verification status
-- **NEW: `!serverinfo`** — server overview with member count, channels, boosts, role count, emoji usage, and more
-- **NEW: `!remindme <time> <message>`** — set personal reminders delivered via DM (supports `30m`, `1h`, `2h30m`, `1d`, etc.)
+- **`!userinfo [member]`** — displays join date, account age, roles, avatar type, and full verification status
+- **`!serverinfo`** — server overview with member count, channels, boosts, role count, emoji usage, and more
+- **`!remindme <time> <message>`** — set personal reminders delivered via DM (supports `30m`, `1h`, `2h30m`, `1d`, etc.)
 
 ### 💰 **Payment Tracking**
 - Track payments owed to team members
@@ -122,6 +151,18 @@ The `!live` command gives streamers a fully interactive flow to post a polished 
 6. The bot sends an `@everyone` embed with the stream category, a direct watch link, and a **Watch Stream** button — all in Kick green
 
 All prompts are ephemeral (only visible to the command user), keeping your server clean.
+
+#### 📢 Announcements — `!announce`
+Now fully modal-based — no more manual embed editing.
+
+**How it works:**
+1. Click the **Make Announcement** button
+2. Fill in the modal form:
+   - **Title**
+   - **Description**
+   - **Color** — choose from blue, red, green, gold, purple, orange, teal, or white
+   - **Image URL** (optional)
+3. The bot posts a polished embed instantly
 
 #### 🎉 Giveaway System — `!gstart`
 The `!gstart` command launches an interactive giveaway modal so staff can run fully automated giveaways without any complex syntax.
@@ -149,6 +190,16 @@ If there aren't enough entrants for the specified winner count, the bot graceful
 ---
 
 ## 📝 Recent Updates
+
+### v1.4.0 — March 2026
+- ✨ Added `!mute` / `!unmute` — temp-mute system with auto-lift, role creation, and DM notifications
+- ✨ Added `!tempban` — timed ban with automatic unban via async background task
+- ✨ Added Welcome Image System — Pillow-generated banners with avatar, username, member count, and server name
+- ✨ Added `!afk` — AFK status with nickname tagging, ping replies, and auto-removal on message
+- ✨ Added `!addcmd` / `!removecmd` / `!listcmds` — per-server custom command manager with built-in command protection
+- ✨ Added `!uptime` — shows bot uptime, start time, and current latency
+- ✨ Improved `!announce` — now fully modal-based with title, description, color picker, and optional image URL
+- ✨ Added Ticket Templates — pre-filled question embeds per category (Report, Technical, etc.)
 
 ### v1.3.0 — March 2026
 - ✨ Added `!live` — interactive Kick.com live announcement system with username input, category picker, and channel selector
@@ -180,6 +231,9 @@ Your bot is ready to use immediately. We provide:
 - Complete walkthrough of all features
 - Admin training for your team
 - Documentation and support
+
+### Step 4: Configure Your Welcome Channel
+Run `!setup` and follow the prompts to designate a welcome channel. The bot will automatically post a generated welcome banner for every new member that joins.
 
 ---
 
