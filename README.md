@@ -109,7 +109,32 @@ Professional Discord bot hosting with full setup and management included. No tec
 - Payment history logging
 
 ### 🎉 **Engagement Tools**
-- Timed giveaway system with multiple winners
+
+#### 🔴 Kick Live Announcements — `!live`
+The `!live` command gives streamers a fully interactive flow to post a polished live notification to any Discord channel — no manual embed editing needed.
+
+**How it works:**
+1. A streamer with the `Streamer`, `Moderator`, `Developer`, `Support`, `Owner`, or `Administrator` role runs `!live`
+2. A private button prompt appears — only visible to them
+3. They click **Set Up Live Announcement** and enter their **Kick.com username**
+4. They pick their **stream category** from a dropdown (Slots & Casino, Just Chatting, Gaming, Sports Betting, and more)
+5. They select which **Discord channel** to post the notification in
+6. The bot sends an `@everyone` embed with the stream category, a direct watch link, and a **Watch Stream** button — all in Kick green
+
+All prompts are ephemeral (only visible to the command user), keeping your server clean.
+
+#### 🎉 Giveaway System — `!gstart`
+The `!gstart` command launches an interactive giveaway modal so staff can run fully automated giveaways without any complex syntax.
+
+**How it works:**
+1. A user with the `Moderator`, `Developer`, `Support`, `Owner`, or `Administrator` role runs `!gstart`
+2. A **Configure Giveaway** button appears (ephemeral, only visible to them)
+3. They fill in a modal with three fields: **Duration** (e.g. `10s`, `30m`, `2h`, `1d`), **Number of Winners**, and **Prize**
+4. The bot posts a public giveaway embed with a countdown timestamp and a 🎉 reaction entry button
+5. When the timer expires, the bot automatically picks the winner(s) at random from all reactor users, mentions them publicly, and updates the embed
+
+If there aren't enough entrants for the specified winner count, the bot gracefully ends the giveaway and notifies the channel.
+
 - Coin flip game
 - Custom server rules display
 - Professional announcements
@@ -124,6 +149,10 @@ Professional Discord bot hosting with full setup and management included. No tec
 ---
 
 ## 📝 Recent Updates
+
+### v1.3.0 — March 2026
+- ✨ Added `!live` — interactive Kick.com live announcement system with username input, category picker, and channel selector
+- ✨ Added `!gstart` — modal-driven giveaway system with automatic winner selection, reaction entry, and timed countdown
 
 ### v1.2.0 — March 2026
 - ✨ Added `!userinfo` — detailed member profile with verification data
