@@ -105,15 +105,31 @@ anti_spam = AntiSpamSystem(
     timeout_seconds=300
 )
 
-PAYMENTS_FILE       = "payments.json"
-CONFIG_FILE         = "server_config.json"
-REMINDERS_FILE      = "reminders.json"
-TEMPMUTE_FILE       = "tempmutes.json"
+PAYMENTS_FILE        = "payments.json"
+CONFIG_FILE          = "server_config.json"
+REMINDERS_FILE       = "reminders.json"
+TEMPMUTE_FILE        = "tempmutes.json"
 CUSTOM_COMMANDS_FILE = "custom_commands.json"
-AFK_FILE            = "afk.json"
+AFK_FILE             = "afk.json"
+WARNINGS_FILE        = "warnings.json"
+SCHEDULES_FILE       = "scheduled_announcements.json"
 
 # Roles allowed to run giveaway commands
 GIVEAWAY_ALLOWED_ROLES = ["Moderator", "Developer", "Support", "Owner"]
+
+# Ticket auto-close: hours of OPENER inactivity before ticket closes
+TICKET_IDLE_HOURS = 24
+
+# Track opener activity per ticket channel  {channel_id: {"opener_id": int, "last_opener_message": datetime}}
+TICKET_ACTIVITY: dict = {}
+
+# Escalating warn punishments  {warn_count: ("action", duration_seconds_or_None, "label")}
+WARN_THRESHOLDS = {
+    3:  ("mute", 3600,   "1-hour mute"),
+    5:  ("mute", 86400,  "24-hour mute"),
+    7:  ("kick", None,   "kick"),
+    10: ("ban",  None,   "permanent ban"),
+}
 
 
 # -------------------------
@@ -175,6 +191,35 @@ def save_reminders(reminders):
         json.dump(reminders, f, indent=4)
 
 # -------------------------
+# WARNINGS HELPERS
+# -------------------------
+def load_warnings():
+    if os.path.exists(WARNINGS_FILE):
+        with open(WARNINGS_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_warnings(data):
+    with open(WARNINGS_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
+def _warn_key(guild_id, user_id):
+    return f"{guild_id}:{user_id}"
+
+# -------------------------
+# SCHEDULES HELPERS
+# -------------------------
+def load_schedules():
+    if os.path.exists(SCHEDULES_FILE):
+        with open(SCHEDULES_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+def save_schedules(data):
+    with open(SCHEDULES_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
+# -------------------------
 # TIME CONVERTER UTILITY
 # -------------------------
 def convert_time(time_str):
@@ -202,6 +247,23 @@ def format_duration(seconds):
     if minutes: parts.append(f"{minutes}m")
     if secs:    parts.append(f"{secs}s")
     return " ".join(parts) if parts else "0s"
+
+
+# ==========================================================
+# AUDIT LOG HELPER
+# ==========================================================
+async def get_audit_channel(guild: discord.Guild):
+    config = load_server_config(guild.id)
+    cid    = config.get("audit_log_channel_id")
+    return guild.get_channel(int(cid)) if cid else None
+
+async def send_audit(guild: discord.Guild, embed: discord.Embed):
+    channel = await get_audit_channel(guild)
+    if channel:
+        try:
+            await channel.send(embed=embed)
+        except Exception as e:
+            print(f"[AuditLog] Could not send: {e}")
 
 
 # ==========================================================
@@ -300,6 +362,7 @@ async def mute(ctx, member: discord.Member, duration: str, *, reason: str = "No 
     embed.add_field(name="📋 Reason",   value=reason,                    inline=False)
     embed.set_footer(text=f"Muted by {ctx.author.display_name}")
     await ctx.send(embed=embed)
+    await send_audit(ctx.guild, embed)
 
     try:
         dm_embed = discord.Embed(
@@ -366,7 +429,6 @@ async def tempban(ctx, member: discord.Member, duration: str, *, reason: str = "
 
     await member.ban(reason=f"[TEMPBAN {format_duration(seconds)}] {reason} | by {ctx.author}")
 
-    # Schedule unban
     async def do_unban():
         await asyncio.sleep(seconds)
         try:
@@ -391,6 +453,374 @@ async def tempban(ctx, member: discord.Member, duration: str, *, reason: str = "
     embed.add_field(name="📋 Reason",   value=reason,                     inline=False)
     embed.set_footer(text=f"Banned by {ctx.author.display_name}")
     await ctx.send(embed=embed)
+    await send_audit(ctx.guild, embed)
+
+
+# ==========================================================
+# WARNING SYSTEM
+# ==========================================================
+@bot.command(name="warn")
+@commands.has_permissions(manage_messages=True)
+async def warn(ctx, member: discord.Member, *, reason: str = "No reason provided"):
+    """Warn a member. Escalating punishments apply automatically."""
+    if member.bot:
+        return await ctx.send("❌ You cannot warn a bot.")
+    if member.top_role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
+        return await ctx.send("❌ You cannot warn someone with an equal or higher role.")
+
+    data = load_warnings()
+    key  = _warn_key(ctx.guild.id, member.id)
+    if key not in data:
+        data[key] = {"guild_id": str(ctx.guild.id), "user_id": str(member.id), "warns": []}
+
+    data[key]["warns"].append({
+        "reason":    reason,
+        "warned_by": str(ctx.author.id),
+        "warned_at": datetime.now(timezone.utc).isoformat(),
+    })
+    save_warnings(data)
+    total = len(data[key]["warns"])
+
+    embed = discord.Embed(
+        title="⚠️ Member Warned",
+        color=discord.Color.orange(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="👤 Member",   value=member.mention, inline=True)
+    embed.add_field(name="⚠️ Warn #",   value=str(total),     inline=True)
+    embed.add_field(name="📋 Reason",   value=reason,         inline=False)
+    embed.set_footer(text=f"Warned by {ctx.author.display_name}")
+    await ctx.send(embed=embed)
+    await send_audit(ctx.guild, embed)
+
+    # DM the warned member
+    try:
+        dm = discord.Embed(
+            title=f"⚠️ You've Been Warned in {ctx.guild.name}",
+            color=discord.Color.orange(),
+        )
+        dm.add_field(name="📋 Reason",      value=reason,     inline=False)
+        dm.add_field(name="⚠️ Total Warns", value=str(total), inline=True)
+        next_thresh = next((c for c in sorted(WARN_THRESHOLDS) if c > total), None)
+        if next_thresh:
+            _, _, label = WARN_THRESHOLDS[next_thresh]
+            dm.add_field(name="⚡ Next Action", value=f"At {next_thresh} warns: **{label}**", inline=True)
+        await member.send(embed=dm)
+    except discord.Forbidden:
+        pass
+
+    # Escalating punishment
+    if total in WARN_THRESHOLDS:
+        action, duration, label = WARN_THRESHOLDS[total]
+        p_embed = discord.Embed(
+            title=f"🚨 Auto-Punishment — {label.title()}",
+            description=f"{member.mention} reached **{total} warnings**.",
+            color=discord.Color.red(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        if action == "mute" and duration:
+            muted_role = await ensure_muted_role(ctx.guild)
+            if muted_role not in member.roles:
+                await member.add_roles(muted_role, reason=f"Auto-mute: {total} warnings")
+            unmute_time = datetime.now(timezone.utc) + timedelta(seconds=duration)
+            mute_data   = load_tempmutes()
+            mute_data[f"{ctx.guild.id}-{member.id}"] = {
+                "guild_id":  str(ctx.guild.id),
+                "user_id":   str(member.id),
+                "unmute_at": unmute_time.isoformat(),
+                "reason":    f"Auto-mute ({total} warnings)",
+                "muted_by":  str(bot.user.id),
+            }
+            save_tempmutes(mute_data)
+            ts = int(unmute_time.timestamp())
+            p_embed.add_field(name="⏱️ Duration", value=format_duration(duration), inline=True)
+            p_embed.add_field(name="📅 Unmute",   value=f"<t:{ts}:R>",             inline=True)
+        elif action == "kick":
+            try:
+                await member.kick(reason=f"Auto-kick: {total} warnings")
+            except discord.Forbidden:
+                p_embed.add_field(name="❌ Error", value="Missing permissions to kick.", inline=False)
+        elif action == "ban":
+            try:
+                await member.ban(reason=f"Auto-ban: {total} warnings")
+            except discord.Forbidden:
+                p_embed.add_field(name="❌ Error", value="Missing permissions to ban.", inline=False)
+
+        await ctx.send(embed=p_embed)
+        await send_audit(ctx.guild, p_embed)
+
+
+@bot.command(name="warnings")
+async def warnings(ctx, member: discord.Member = None):
+    """View warnings for a member. Defaults to yourself."""
+    target = member or ctx.author
+    if member and member != ctx.author and not ctx.author.guild_permissions.manage_messages:
+        return await ctx.send("❌ You don't have permission to view other members' warnings.")
+
+    data  = load_warnings()
+    key   = _warn_key(ctx.guild.id, target.id)
+    warns = data.get(key, {}).get("warns", [])
+
+    embed = discord.Embed(
+        title=f"⚠️ Warnings — {target.display_name}",
+        color=discord.Color.orange() if warns else discord.Color.green(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_thumbnail(url=target.display_avatar.url)
+    if not warns:
+        embed.description = f"✅ {target.mention} has no warnings."
+    else:
+        embed.description = f"{target.mention} has **{len(warns)}** warning(s)."
+        for i, w in enumerate(warns[-10:], 1):
+            ts = int(datetime.fromisoformat(w["warned_at"]).timestamp())
+            embed.add_field(
+                name=f"⚠️ Warning #{i}",
+                value=f"**Reason:** {w['reason']}\n**When:** <t:{ts}:R>",
+                inline=False,
+            )
+        next_thresh = next((c for c in sorted(WARN_THRESHOLDS) if c > len(warns)), None)
+        if next_thresh:
+            _, _, label = WARN_THRESHOLDS[next_thresh]
+            embed.add_field(name="⚡ Next Threshold", value=f"At **{next_thresh}** warns: **{label}**", inline=False)
+    embed.set_footer(text=f"Requested by {ctx.author.display_name}")
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="clearwarns")
+@commands.has_permissions(manage_messages=True)
+async def clearwarns(ctx, member: discord.Member, index: int = None):
+    """Clear warnings. !clearwarns @user = all | !clearwarns @user 2 = specific"""
+    data = load_warnings()
+    key  = _warn_key(ctx.guild.id, member.id)
+    if key not in data or not data[key]["warns"]:
+        return await ctx.send(f"✅ {member.mention} has no warnings to clear.")
+    if index is None:
+        count = len(data[key]["warns"])
+        data[key]["warns"] = []
+        save_warnings(data)
+        await ctx.send(f"✅ Cleared all **{count}** warning(s) for {member.mention}.")
+    else:
+        warns = data[key]["warns"]
+        if index < 1 or index > len(warns):
+            return await ctx.send(f"❌ Invalid index. {member.mention} has {len(warns)} warning(s).")
+        removed = warns.pop(index - 1)
+        save_warnings(data)
+        await ctx.send(f"✅ Removed warning #{index} (`{removed['reason']}`) from {member.mention}.")
+
+
+# ==========================================================
+# SLOWMODE COMMAND
+# ==========================================================
+@bot.command(name="slowmode")
+@commands.has_permissions(manage_channels=True)
+async def slowmode(ctx, time_str: str = "0", channel: discord.TextChannel = None):
+    """
+    Set slowmode. Usage:
+      !slowmode 30s           — current channel
+      !slowmode 5m #general   — specific channel
+      !slowmode off           — disable
+    Max: 6 hours (21600s).
+    """
+    target = channel or ctx.channel
+    if time_str.lower() in ("off", "0", "disable"):
+        seconds = 0
+    else:
+        seconds = convert_time(time_str)
+        if seconds == 0:
+            return await ctx.send("❌ Invalid time. Examples: `10s`, `30s`, `5m`, `1h` or `off`")
+        if seconds > 21600:
+            return await ctx.send("❌ Discord's maximum slowmode is 6 hours (21600s).")
+
+    await target.edit(slowmode_delay=seconds)
+
+    if seconds == 0:
+        embed = discord.Embed(
+            title="✅ Slowmode Disabled",
+            description=f"Slowmode has been turned off in {target.mention}.",
+            color=discord.Color.green(),
+        )
+    else:
+        embed = discord.Embed(
+            title="🐢 Slowmode Enabled",
+            color=discord.Color.orange(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(name="💬 Channel",  value=target.mention,           inline=True)
+        embed.add_field(name="⏱️ Interval", value=format_duration(seconds), inline=True)
+        embed.set_footer(text=f"Set by {ctx.author.display_name}")
+
+    await ctx.send(embed=embed)
+
+    audit_embed = discord.Embed(
+        title="🐢 Slowmode Changed",
+        color=discord.Color.orange(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    audit_embed.add_field(name="💬 Channel", value=target.mention, inline=True)
+    audit_embed.add_field(name="⏱️ Delay",   value=format_duration(seconds) if seconds else "Off", inline=True)
+    audit_embed.add_field(name="👤 Set By",  value=ctx.author.mention, inline=True)
+    await send_audit(ctx.guild, audit_embed)
+
+
+# ==========================================================
+# SCHEDULED ANNOUNCEMENTS
+# ==========================================================
+@tasks.loop(seconds=30)
+async def scheduled_announcements_loop():
+    schedules = load_schedules()
+    now       = datetime.now(timezone.utc)
+    remaining = []
+    changed   = False
+    for item in schedules:
+        fire_time = datetime.fromisoformat(item["fire_at"])
+        if now >= fire_time:
+            try:
+                guild   = bot.get_guild(int(item["guild_id"]))
+                channel = guild.get_channel(int(item["channel_id"])) if guild else None
+                if channel:
+                    embed = discord.Embed(
+                        title="📢 Scheduled Announcement",
+                        description=item["message"],
+                        color=discord.Color.blue(),
+                        timestamp=now,
+                    )
+                    embed.set_footer(text=f"Scheduled by {item['author_name']}")
+                    mention = "@everyone" if item.get("mention_everyone") else None
+                    await channel.send(content=mention, embed=embed)
+            except Exception as e:
+                print(f"[Schedule] Error firing announcement: {e}")
+            changed = True
+        else:
+            remaining.append(item)
+    if changed:
+        save_schedules(remaining)
+
+
+@bot.command(name="schedule")
+@commands.has_permissions(administrator=True)
+async def schedule(ctx, channel: discord.TextChannel, time_str: str, *, message: str):
+    """
+    Schedule an announcement.
+    Usage: !schedule #channel 2h Your message here
+    Add --everyone at the end to ping @everyone.
+    """
+    mention_everyone = False
+    if message.endswith("--everyone"):
+        mention_everyone = True
+        message = message[:-len("--everyone")].strip()
+
+    seconds = convert_time(time_str)
+    if seconds == 0:
+        return await ctx.send("❌ Invalid time format. Examples: `30m`, `2h`, `1d`, `1h30m`")
+    if seconds < 30:
+        return await ctx.send("❌ Minimum schedule time is 30 seconds.")
+    if seconds > 2592000:
+        return await ctx.send("❌ Maximum schedule time is 30 days.")
+
+    fire_at = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+    ts      = int(fire_at.timestamp())
+
+    schedules = load_schedules()
+    schedules.append({
+        "guild_id":         str(ctx.guild.id),
+        "channel_id":       str(channel.id),
+        "message":          message,
+        "fire_at":          fire_at.isoformat(),
+        "author_name":      ctx.author.display_name,
+        "mention_everyone": mention_everyone,
+    })
+    save_schedules(schedules)
+
+    embed = discord.Embed(
+        title="📅 Announcement Scheduled",
+        color=discord.Color.green(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="📢 Channel", value=channel.mention,          inline=True)
+    embed.add_field(name="⏱️ In",      value=format_duration(seconds), inline=True)
+    embed.add_field(name="🕐 Fire At", value=f"<t:{ts}:F>",            inline=True)
+    embed.add_field(name="📝 Message", value=message[:500],            inline=False)
+    if mention_everyone:
+        embed.add_field(name="📣 Mention", value="@everyone will be pinged", inline=False)
+    embed.set_footer(text=f"Scheduled by {ctx.author.display_name}")
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="schedule_list")
+@commands.has_permissions(administrator=True)
+async def schedule_list(ctx):
+    """List all pending scheduled announcements for this server."""
+    schedules   = load_schedules()
+    guild_items = [s for s in schedules if s["guild_id"] == str(ctx.guild.id)]
+    if not guild_items:
+        return await ctx.send("📭 No scheduled announcements for this server.")
+    embed = discord.Embed(
+        title="📅 Scheduled Announcements",
+        description=f"**{len(guild_items)}** pending announcement(s)",
+        color=discord.Color.blurple(),
+    )
+    for i, item in enumerate(guild_items[:10], 1):
+        ts      = int(datetime.fromisoformat(item["fire_at"]).timestamp())
+        channel = ctx.guild.get_channel(int(item["channel_id"]))
+        embed.add_field(
+            name=f"#{i} — <t:{ts}:R>",
+            value=f"**Channel:** {channel.mention if channel else 'Unknown'}\n**Message:** {item['message'][:80]}",
+            inline=False,
+        )
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="schedule_cancel")
+@commands.has_permissions(administrator=True)
+async def schedule_cancel(ctx, index: int):
+    """Cancel a scheduled announcement by its list number (from !schedule_list)."""
+    schedules   = load_schedules()
+    guild_items = [s for s in schedules if s["guild_id"] == str(ctx.guild.id)]
+    if index < 1 or index > len(guild_items):
+        return await ctx.send("❌ Invalid index. Use `!schedule_list` to see pending announcements.")
+    target = guild_items[index - 1]
+    schedules.remove(target)
+    save_schedules(schedules)
+    await ctx.send(f"✅ Scheduled announcement #{index} has been cancelled.")
+
+
+# ==========================================================
+# AUDIT LOG SETUP COMMAND
+# ==========================================================
+@bot.command(name="setauditlog")
+@commands.has_permissions(administrator=True)
+async def setauditlog(ctx, channel: discord.TextChannel = None):
+    """Set or view the audit log channel. Usage: !setauditlog #channel"""
+    config = load_server_config(ctx.guild.id)
+    if channel is None:
+        current_id = config.get("audit_log_channel_id")
+        if current_id:
+            ch = ctx.guild.get_channel(int(current_id))
+            return await ctx.send(f"📋 Audit log channel: {ch.mention if ch else f'ID {current_id} (not found)'}.")
+        return await ctx.send("❌ No audit log channel set. Use `!setauditlog #channel`.")
+
+    config["audit_log_channel_id"] = str(channel.id)
+    save_server_config(ctx.guild.id, config)
+    embed = discord.Embed(
+        title="✅ Audit Log Channel Set",
+        description=f"Server events will now be logged to {channel.mention}.",
+        color=discord.Color.green(),
+    )
+    embed.add_field(
+        name="📋 What gets logged",
+        value=(
+            "• ✏️ Message edits (before & after)\n"
+            "• 🗑️ Message deletes\n"
+            "• 📥 Member joins & 📤 leaves\n"
+            "• 🎭 Role changes & ✏️ nickname changes\n"
+            "• 🔨 Bans & Unbans\n"
+            "• 🐢 Slowmode changes\n"
+            "• ⚠️ Warnings & auto-punishments\n"
+            "• 🔇 Mutes & Temp-bans"
+        ),
+        inline=False,
+    )
+    await ctx.send(embed=embed)
 
 
 # ==========================================================
@@ -412,8 +842,8 @@ async def afk(ctx, *, reason: str = "AFK"):
     """Set yourself as AFK. The bot will reply when someone pings you."""
     afk_data = load_afk()
     afk_data[str(ctx.author.id)] = {
-        "reason":  reason,
-        "set_at":  datetime.now(timezone.utc).isoformat(),
+        "reason":   reason,
+        "set_at":   datetime.now(timezone.utc).isoformat(),
         "guild_id": str(ctx.guild.id)
     }
     save_afk(afk_data)
@@ -423,8 +853,7 @@ async def afk(ctx, *, reason: str = "AFK"):
         color=discord.Color.light_grey()
     )
     embed.set_footer(text="You'll be removed from AFK when you send a message.")
-    msg = await ctx.send(embed=embed)
-    # Try to rename the user with [AFK] prefix
+    await ctx.send(embed=embed)
     try:
         if not ctx.author.display_name.startswith("[AFK]"):
             await ctx.author.edit(nick=f"[AFK] {ctx.author.display_name[:28]}")
@@ -451,7 +880,6 @@ def save_custom_commands(data):
 async def addcmd(ctx, command_name: str, *, response: str):
     """Add a custom command. Usage: !addcmd discord Join us at discord.gg/example"""
     command_name = command_name.lower().lstrip("!")
-    # Block overriding built-in commands
     builtin = {c.name for c in bot.commands}
     if command_name in builtin:
         return await ctx.send(f"❌ `!{command_name}` is a built-in command and cannot be overridden.")
@@ -460,15 +888,12 @@ async def addcmd(ctx, command_name: str, *, response: str):
     if guild_str not in data:
         data[guild_str] = {}
     data[guild_str][command_name] = {
-        "response":    response,
-        "created_by":  str(ctx.author.id),
-        "created_at":  datetime.now(timezone.utc).isoformat()
+        "response":   response,
+        "created_by": str(ctx.author.id),
+        "created_at": datetime.now(timezone.utc).isoformat()
     }
     save_custom_commands(data)
-    embed = discord.Embed(
-        title="✅ Custom Command Added",
-        color=discord.Color.green()
-    )
+    embed = discord.Embed(title="✅ Custom Command Added", color=discord.Color.green())
     embed.add_field(name="Command",  value=f"`!{command_name}`", inline=True)
     embed.add_field(name="Response", value=response[:200],       inline=False)
     await ctx.send(embed=embed)
@@ -533,30 +958,19 @@ async def generate_welcome_image(member: discord.Member) -> io.BytesIO | None:
     if not PILLOW_AVAILABLE:
         return None
     try:
-        # Canvas
         W, H = 900, 300
         img = Image.new("RGBA", (W, H), (30, 30, 47, 255))
         draw = ImageDraw.Draw(img)
-
-        # Gradient-style background bars
         for i in range(H):
             alpha = int(80 * (i / H))
             draw.line([(0, i), (W, i)], fill=(88, 101, 242, alpha))
-
-        # Border
         draw.rectangle([2, 2, W - 3, H - 3], outline=(88, 101, 242, 200), width=3)
-
-        # Avatar
         avatar_size = 160
         avatar_data = await member.display_avatar.with_size(256).read()
         avatar_img  = Image.open(io.BytesIO(avatar_data)).convert("RGBA").resize((avatar_size, avatar_size))
-
-        # Circular mask
         mask = Image.new("L", (avatar_size, avatar_size), 0)
         ImageDraw.Draw(mask).ellipse([0, 0, avatar_size, avatar_size], fill=255)
         avatar_img.putalpha(mask)
-
-        # Circle border
         border_size = avatar_size + 8
         border_img  = Image.new("RGBA", (border_size, border_size), (0, 0, 0, 0))
         ImageDraw.Draw(border_img).ellipse([0, 0, border_size, border_size], fill=(88, 101, 242, 255))
@@ -564,23 +978,18 @@ async def generate_welcome_image(member: discord.Member) -> io.BytesIO | None:
         border_y = (H - border_size) // 2
         img.paste(border_img, (border_x, border_y), border_img)
         img.paste(avatar_img, (border_x + 4, border_y + 4), avatar_img)
-
-        # Text
         text_x = border_x + border_size + 30
         try:
-            font_big   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",  48)
-            font_med   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",       28)
-            font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",       22)
+            font_big   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 48)
+            font_med   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",      28)
+            font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",      22)
         except Exception:
             font_big = font_med = font_small = ImageFont.load_default()
-
-        draw.text((text_x, 70),  "WELCOME",               font=font_big,   fill=(88, 101, 242, 255))
+        draw.text((text_x, 70),  "WELCOME", font=font_big, fill=(88, 101, 242, 255))
         name = member.display_name[:24] + ("…" if len(member.display_name) > 24 else "")
-        draw.text((text_x, 130), name,                    font=font_med,   fill=(255, 255, 255, 230))
-        draw.text((text_x, 175), f"Member #{member.guild.member_count}",
-                  font=font_small, fill=(185, 187, 190, 200))
+        draw.text((text_x, 130), name, font=font_med, fill=(255, 255, 255, 230))
+        draw.text((text_x, 175), f"Member #{member.guild.member_count}", font=font_small, fill=(185, 187, 190, 200))
         draw.text((text_x, 210), member.guild.name[:40], font=font_small, fill=(130, 140, 160, 200))
-
         output = io.BytesIO()
         img.save(output, format="PNG")
         output.seek(0)
@@ -594,7 +1003,7 @@ async def generate_welcome_image(member: discord.Member) -> io.BytesIO | None:
 # KICK LIVE ANNOUNCEMENT SYSTEM
 # ==========================================================
 KICK_HEADERS = {
-    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept":          "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
     "Referer":         "https://kick.com/",
@@ -609,15 +1018,9 @@ class LiveChannelSelect(Select):
         self.kick_username = kick_username
         self.category = category
         text_channels = [ch for ch in guild.text_channels if ch.permissions_for(guild.me).send_messages][:25]
-        options = [
-            discord.SelectOption(label=f"#{ch.name}", value=str(ch.id))
-            for ch in text_channels
-        ]
-        super().__init__(
-            placeholder="Select announcement channel...",
-            min_values=1, max_values=1,
-            options=options, custom_id="live_channel_select"
-        )
+        options = [discord.SelectOption(label=f"#{ch.name}", value=str(ch.id)) for ch in text_channels]
+        super().__init__(placeholder="Select announcement channel...", min_values=1, max_values=1,
+                         options=options, custom_id="live_channel_select")
 
     async def callback(self, interaction: discord.Interaction):
         channel_id = int(self.values[0])
@@ -633,14 +1036,11 @@ class LiveChannelSelect(Select):
                         inline=False)
         embed.set_footer(text=f"Went live • {now.strftime('%B %d, %Y at %I:%M %p UTC')}")
         view = discord.ui.View()
-        view.add_item(discord.ui.Button(label="▶  Watch Stream",
-                                        url=f"https://kick.com/{self.kick_username}",
+        view.add_item(discord.ui.Button(label="▶  Watch Stream", url=f"https://kick.com/{self.kick_username}",
                                         style=discord.ButtonStyle.link))
         await channel.send("@everyone", embed=embed, view=view)
-        await interaction.response.edit_message(
-            content=f"✅ Live announcement posted in {channel.mention}!",
-            embed=None, view=None
-        )
+        await interaction.response.edit_message(content=f"✅ Live announcement posted in {channel.mention}!",
+                                                 embed=None, view=None)
 
 
 class LiveCategorySelect(Select):
@@ -658,9 +1058,8 @@ class LiveCategorySelect(Select):
             discord.SelectOption(label="⚽ Sports",          value="Sports"),
             discord.SelectOption(label="📦 Unboxing",        value="Unboxing"),
         ]
-        super().__init__(placeholder="Select your stream category...",
-                         min_values=1, max_values=1, options=options,
-                         custom_id="live_category_select")
+        super().__init__(placeholder="Select your stream category...", min_values=1, max_values=1,
+                         options=options, custom_id="live_category_select")
 
     async def callback(self, interaction: discord.Interaction):
         selected_category = self.values[0]
@@ -675,12 +1074,8 @@ class LiveCategorySelect(Select):
 
 
 class LiveKickUsernameModal(Modal, title="🔴 Go Live — Kick Username"):
-    kick_username = TextInput(
-        label="Your Kick.com Username",
-        placeholder="e.g. NotLilKev",
-        max_length=50,
-        style=discord.TextStyle.short
-    )
+    kick_username = TextInput(label="Your Kick.com Username", placeholder="e.g. NotLilKev",
+                              max_length=50, style=discord.TextStyle.short)
 
     async def on_submit(self, interaction: discord.Interaction):
         username = self.kick_username.value.strip().lstrip("@")
@@ -719,7 +1114,7 @@ async def live(ctx: commands.Context):
 
     embed = discord.Embed(
         title="🔴 Go Live",
-        description="Click the button below to set up your live announcement.\nYou'll enter your Kick username, pick your category, and choose where to post it.",
+        description="Click the button below to set up your live announcement.",
         color=0x53FC18
     )
     embed.set_footer(text="Only visible to you")
@@ -727,7 +1122,7 @@ async def live(ctx: commands.Context):
 
 
 # ==========================================================
-# KeepAlive Task & Event Handlers
+# BACKGROUND TASKS
 # ==========================================================
 @tasks.loop(minutes=30)
 async def keep_alive():
@@ -776,6 +1171,83 @@ async def reminder_loop():
     save_reminders(remaining)
 
 
+@tasks.loop(minutes=15)
+async def ticket_idle_checker():
+    """Auto-close tickets where the opener hasn't replied in TICKET_IDLE_HOURS hours."""
+    now      = datetime.now(timezone.utc)
+    idle_for = timedelta(hours=TICKET_IDLE_HOURS)
+    to_close = []
+
+    for channel_id, entry in list(TICKET_ACTIVITY.items()):
+        last_msg = entry.get("last_opener_message")
+        if last_msg and (now - last_msg) >= idle_for:
+            to_close.append((channel_id, entry["opener_id"]))
+
+    for channel_id, opener_id in to_close:
+        for guild in bot.guilds:
+            channel = guild.get_channel(channel_id)
+            if channel:
+                await _auto_close_ticket(channel, opener_id)
+                break
+
+
+async def _auto_close_ticket(channel: discord.TextChannel, opener_id: int):
+    """Close a ticket due to opener inactivity."""
+    try:
+        embed = discord.Embed(
+            title="🔒 Ticket Auto-Closed",
+            description=(
+                f"This ticket was automatically closed because <@{opener_id}> "
+                f"hasn't replied in **{TICKET_IDLE_HOURS} hours**."
+            ),
+            color=discord.Color.red(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_footer(text="Auto-close system")
+        await channel.send(embed=embed)
+
+        ticket_number = channel.name.split("-")[-1]
+        ticket_data   = load_ticket_data()
+        for guild_str, gdata in ticket_data.items():
+            ticket_key = f"ticket-{ticket_number}"
+            if ticket_key in gdata.get("tickets", {}):
+                gdata["tickets"][ticket_key]["status"]    = "closed"
+                gdata["tickets"][ticket_key]["closed_at"] = datetime.now(timezone.utc).isoformat()
+                gdata["tickets"][ticket_key]["closed_by"] = "auto-close"
+        save_ticket_data(ticket_data)
+
+        try:
+            member = channel.guild.get_member(opener_id)
+            if member:
+                dm = discord.Embed(
+                    title="🔒 Your Ticket Was Auto-Closed",
+                    description=(
+                        f"Your ticket in **{channel.guild.name}** was automatically closed because "
+                        f"you hadn't replied in **{TICKET_IDLE_HOURS} hours**.\n\n"
+                        "Open a new ticket any time you need help!"
+                    ),
+                    color=discord.Color.orange(),
+                )
+                await member.send(embed=dm)
+        except Exception:
+            pass
+
+        await asyncio.sleep(5)
+        await channel.delete(reason="Auto-closed: opener inactivity")
+        if channel.id in TICKET_ACTIVITY:
+            del TICKET_ACTIVITY[channel.id]
+    except Exception as e:
+        print(f"[TicketAutoClose] Error closing {channel.name}: {e}")
+
+
+def register_ticket_for_autoclose(channel_id: int, opener_id: int):
+    """Register a ticket channel for idle tracking."""
+    TICKET_ACTIVITY[channel_id] = {
+        "opener_id":           opener_id,
+        "last_opener_message": datetime.now(timezone.utc),
+    }
+
+
 # -------------------------
 # BOT EVENTS
 # -------------------------
@@ -796,7 +1268,128 @@ async def on_ready():
     update_stats.start()
     reminder_loop.start()
     tempmute_checker.start()
+    scheduled_announcements_loop.start()
+    ticket_idle_checker.start()
     print("[Bot] All background tasks started")
+
+
+# -------------------------
+# AUDIT LOG EVENTS
+# -------------------------
+@bot.event
+async def on_message_edit(before, after):
+    if before.author.bot or not before.guild:
+        return
+    if before.content == after.content:
+        return
+    embed = discord.Embed(
+        title="✏️ Message Edited",
+        color=discord.Color.yellow(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_author(name=str(before.author), icon_url=before.author.display_avatar.url)
+    embed.add_field(name="👤 User",    value=before.author.mention,  inline=True)
+    embed.add_field(name="💬 Channel", value=before.channel.mention, inline=True)
+    embed.add_field(name="🔗 Jump",    value=f"[Go to message]({after.jump_url})", inline=True)
+    embed.add_field(name="📄 Before",  value=before.content[:1000] or "*empty*", inline=False)
+    embed.add_field(name="📄 After",   value=after.content[:1000]  or "*empty*", inline=False)
+    embed.set_footer(text=f"User ID: {before.author.id}")
+    await send_audit(before.guild, embed)
+
+
+@bot.event
+async def on_message_delete(message):
+    if message.author.bot or not message.guild:
+        return
+    embed = discord.Embed(
+        title="🗑️ Message Deleted",
+        color=discord.Color.red(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_author(name=str(message.author), icon_url=message.author.display_avatar.url)
+    embed.add_field(name="👤 User",    value=message.author.mention,  inline=True)
+    embed.add_field(name="💬 Channel", value=message.channel.mention, inline=True)
+    embed.add_field(name="📄 Content", value=message.content[:1000] or "*no text content*", inline=False)
+    if message.attachments:
+        embed.add_field(name="📎 Attachments",
+                        value="\n".join(a.filename for a in message.attachments), inline=False)
+    embed.set_footer(text=f"User ID: {message.author.id}")
+    await send_audit(message.guild, embed)
+
+
+@bot.event
+async def on_member_remove(member):
+    roles = [r.name for r in member.roles if r.name != "@everyone"]
+    embed = discord.Embed(
+        title="📤 Member Left",
+        color=discord.Color.orange(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_author(name=str(member), icon_url=member.display_avatar.url)
+    embed.add_field(name="👤 User",  value=f"{member} ({member.id})",               inline=True)
+    embed.add_field(name="🏷️ Roles", value=", ".join(roles) if roles else "None",   inline=False)
+    embed.set_footer(text=f"Members remaining: {member.guild.member_count}")
+    await send_audit(member.guild, embed)
+
+
+@bot.event
+async def on_member_update(before, after):
+    if not before.guild:
+        return
+    added   = [r for r in after.roles  if r not in before.roles]
+    removed = [r for r in before.roles if r not in after.roles]
+    if added or removed:
+        embed = discord.Embed(
+            title="🎭 Member Roles Updated",
+            color=discord.Color.blurple(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_author(name=str(after), icon_url=after.display_avatar.url)
+        embed.add_field(name="👤 User", value=after.mention, inline=True)
+        if added:
+            embed.add_field(name="➕ Roles Added",   value=" ".join(r.mention for r in added),   inline=False)
+        if removed:
+            embed.add_field(name="➖ Roles Removed", value=" ".join(r.mention for r in removed), inline=False)
+        embed.set_footer(text=f"User ID: {after.id}")
+        await send_audit(after.guild, embed)
+    if before.nick != after.nick:
+        embed = discord.Embed(
+            title="✏️ Nickname Changed",
+            color=discord.Color.light_grey(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_author(name=str(after), icon_url=after.display_avatar.url)
+        embed.add_field(name="👤 User",   value=after.mention,              inline=True)
+        embed.add_field(name="📄 Before", value=before.nick or "*none*",    inline=True)
+        embed.add_field(name="📄 After",  value=after.nick  or "*removed*", inline=True)
+        embed.set_footer(text=f"User ID: {after.id}")
+        await send_audit(after.guild, embed)
+
+
+@bot.event
+async def on_member_ban(guild, user):
+    embed = discord.Embed(
+        title="🔨 Member Banned",
+        color=discord.Color.dark_red(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_author(name=str(user), icon_url=user.display_avatar.url)
+    embed.add_field(name="👤 User", value=f"{user} ({user.id})", inline=True)
+    embed.set_footer(text=f"User ID: {user.id}")
+    await send_audit(guild, embed)
+
+
+@bot.event
+async def on_member_unban(guild, user):
+    embed = discord.Embed(
+        title="✅ Member Unbanned",
+        color=discord.Color.green(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_author(name=str(user), icon_url=user.display_avatar.url)
+    embed.add_field(name="👤 User", value=f"{user} ({user.id})", inline=True)
+    embed.set_footer(text=f"User ID: {user.id}")
+    await send_audit(guild, embed)
 
 
 # -------------------------
@@ -813,6 +1406,12 @@ async def on_message(message):
 
     user_id = message.author.id
 
+    # ── Ticket opener activity tracking ──
+    if message.channel.id in TICKET_ACTIVITY:
+        entry = TICKET_ACTIVITY[message.channel.id]
+        if message.author.id == entry["opener_id"]:
+            entry["last_opener_message"] = datetime.now(timezone.utc)
+
     # ── AFK: remove AFK when the user sends a message ──
     afk_data = load_afk()
     if str(user_id) in afk_data:
@@ -825,7 +1424,7 @@ async def on_message(message):
         except discord.Forbidden:
             pass
         try:
-            back_msg = await message.channel.send(
+            await message.channel.send(
                 f"👋 Welcome back {message.author.mention}, your AFK has been removed!", delete_after=8
             )
         except Exception:
@@ -834,7 +1433,7 @@ async def on_message(message):
     # ── AFK: notify sender if they pinged an AFK user ──
     for mentioned in message.mentions:
         if str(mentioned.id) in afk_data:
-            info = afk_data[str(mentioned.id)]
+            info   = afk_data[str(mentioned.id)]
             set_ts = int(datetime.fromisoformat(info["set_at"]).timestamp())
             await message.channel.send(
                 f"💤 {mentioned.display_name} is AFK — **{info['reason']}** (since <t:{set_ts}:R>)",
@@ -997,7 +1596,6 @@ async def on_message(message):
         data = load_custom_commands()
         guild_cmds = data.get(str(message.guild.id), {})
         if cmd_name in guild_cmds:
-            # Only fire if it's not a built-in
             builtin = {c.name for c in bot.commands}
             if cmd_name not in builtin:
                 await message.channel.send(guild_cmds[cmd_name]["response"])
@@ -1111,19 +1709,18 @@ class TicketRatingView(View):
             child.disabled = True
         await interaction.response.edit_message(embed=embed, view=self)
 
-    @discord.ui.button(label="⭐",     style=discord.ButtonStyle.secondary, custom_id="rate_1")
+    @discord.ui.button(label="⭐",       style=discord.ButtonStyle.secondary, custom_id="rate_1")
     async def rate_1(self, i, b): await self._record_rating(i, 1, "⭐ (1/5)")
-    @discord.ui.button(label="⭐⭐",   style=discord.ButtonStyle.secondary, custom_id="rate_2")
+    @discord.ui.button(label="⭐⭐",     style=discord.ButtonStyle.secondary, custom_id="rate_2")
     async def rate_2(self, i, b): await self._record_rating(i, 2, "⭐⭐ (2/5)")
-    @discord.ui.button(label="⭐⭐⭐", style=discord.ButtonStyle.secondary, custom_id="rate_3")
+    @discord.ui.button(label="⭐⭐⭐",   style=discord.ButtonStyle.secondary, custom_id="rate_3")
     async def rate_3(self, i, b): await self._record_rating(i, 3, "⭐⭐⭐ (3/5)")
-    @discord.ui.button(label="⭐⭐⭐⭐",  style=discord.ButtonStyle.secondary, custom_id="rate_4")
+    @discord.ui.button(label="⭐⭐⭐⭐",   style=discord.ButtonStyle.secondary, custom_id="rate_4")
     async def rate_4(self, i, b): await self._record_rating(i, 4, "⭐⭐⭐⭐ (4/5)")
     @discord.ui.button(label="⭐⭐⭐⭐⭐", style=discord.ButtonStyle.success,   custom_id="rate_5")
     async def rate_5(self, i, b): await self._record_rating(i, 5, "⭐⭐⭐⭐⭐ (5/5)")
 
 
-# ── Ticket templates per category ─────────────────────────
 TICKET_TEMPLATES = {
     "💰 General Support": (
         "**Please answer the following:**\n\n"
@@ -1179,9 +1776,8 @@ class TicketCategorySelect(Select):
             discord.SelectOption(label="💡 Suggestion",        description="Suggest improvements",             emoji="💡"),
             discord.SelectOption(label="❓ General Question",  description="General inquiry",                  emoji="❓"),
         ]
-        super().__init__(placeholder="Select a ticket category...",
-                         min_values=1, max_values=1, options=options,
-                         custom_id="ticket_category_select")
+        super().__init__(placeholder="Select a ticket category...", min_values=1, max_values=1,
+                         options=options, custom_id="ticket_category_select")
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(ReportModal(self.values[0]))
@@ -1254,6 +1850,9 @@ class TicketControlsView(View):
                 embed=close_embed,
                 file=discord.File(html_transcript, filename=f"ticket-{ticket_number}-transcript.html")
             )
+        # Remove from idle tracking
+        if interaction.channel.id in TICKET_ACTIVITY:
+            del TICKET_ACTIVITY[interaction.channel.id]
         try:
             member = interaction.guild.get_member(int(user_id))
             if member:
@@ -1358,7 +1957,7 @@ class ReportModal(Modal):
     async def on_submit(self, interaction: discord.Interaction):
         guild = interaction.guild
         for ch in guild.text_channels:
-            if f"ticket-" in ch.name and ch.topic and str(interaction.user.id) in ch.topic:
+            if "ticket-" in ch.name and ch.topic and str(interaction.user.id) in ch.topic:
                 return await interaction.response.send_message(
                     f"⚠️ You already have an open ticket: {ch.mention}", ephemeral=True
                 )
@@ -1380,6 +1979,10 @@ class ReportModal(Modal):
             topic=f"Ticket #{ticket_number} | User: {interaction.user.name} | ID: {interaction.user.id}",
             overwrites=overwrites
         )
+
+        # Register for auto-close idle tracking
+        register_ticket_for_autoclose(ticket_channel.id, interaction.user.id)
+
         embed = discord.Embed(
             title=f"🎫 {self.issue_title.value}",
             description=f"**Category:** {self.category}\n**Opened By:** {interaction.user.mention} ({interaction.user.id})",
@@ -1390,10 +1993,10 @@ class ReportModal(Modal):
         embed.add_field(name="📝 Status",        value="🔵 Open",           inline=True)
         embed.add_field(name="🎫 Ticket Number", value=f"#{ticket_number}", inline=True)
         embed.add_field(name="📋 Issue Details", value=f"```\n{self.issue_details.value[:500]}\n```", inline=False)
+        embed.add_field(name="⏰ Auto-Close",    value=f"Closes after **{TICKET_IDLE_HOURS}h** of opener inactivity", inline=False)
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
         embed.set_footer(text=f"Ticket #{ticket_number} | Created")
 
-        # Post ticket template for this category
         template_text = TICKET_TEMPLATES.get(self.category, "")
         welcome_msg = (
             f"{interaction.user.mention} Welcome to your support ticket!\n\n"
@@ -1481,7 +2084,7 @@ async def rules(ctx):
 # -------------------------
 # ADVANCED VERIFICATION SYSTEM
 # -------------------------
-VERIFICATION_FILE    = "verifications.json"
+VERIFICATION_FILE     = "verifications.json"
 PENDING_VERIFICATIONS = {}
 
 def load_verifications():
@@ -1528,7 +2131,7 @@ class VerifyButton(View):
 
     @discord.ui.button(label="🔐 Verify", style=discord.ButtonStyle.success, custom_id="verify_button_main")
     async def verify_button(self, interaction: discord.Interaction, button: Button):
-        config          = load_server_config(interaction.guild.id)
+        config           = load_server_config(interaction.guild.id)
         verified_role_id = config.get("verified_role_id")
         if not verified_role_id:
             return await interaction.response.send_message("❌ Verification is not set up for this server.", ephemeral=True)
@@ -1577,7 +2180,7 @@ class VerifyButton(View):
 async def verify(ctx: commands.Context, member: discord.Member = None):
     if member is None:
         member = ctx.author
-    config          = load_server_config(ctx.guild.id)
+    config           = load_server_config(ctx.guild.id)
     verified_role_id = config.get("verified_role_id")
     if not verified_role_id:
         return await ctx.send("❌ Verified role not set. Use `!setup` to configure.")
@@ -1588,11 +2191,11 @@ async def verify(ctx: commands.Context, member: discord.Member = None):
     verification_data = load_verifications()
     account_analysis  = check_account_age(member)
     verification_data[str(member.id)] = {
-        "verified_at":     datetime.now(timezone.utc).isoformat(),
-        "verified_by":     str(ctx.author.id),
-        "manual":          True,
+        "verified_at":      datetime.now(timezone.utc).isoformat(),
+        "verified_by":      str(ctx.author.id),
+        "manual":           True,
         "account_age_days": account_analysis["account_age_days"],
-        "guild_id":        str(ctx.guild.id)
+        "guild_id":         str(ctx.guild.id)
     }
     save_verifications(verification_data)
     await ctx.send(f"✅ {member.mention} has been manually verified!")
@@ -1631,6 +2234,23 @@ async def sendverify(ctx):
 async def on_member_join(member):
     await asyncio.sleep(2)
     config = load_server_config(member.guild.id)
+
+    # ── Audit log ──
+    now = datetime.now(timezone.utc)
+    age = (now - member.created_at).days
+    audit_embed = discord.Embed(
+        title="📥 Member Joined",
+        color=discord.Color.green(),
+        timestamp=now,
+    )
+    audit_embed.set_author(name=str(member), icon_url=member.display_avatar.url)
+    audit_embed.add_field(name="👤 User",        value=member.mention,                                 inline=True)
+    audit_embed.add_field(name="🆔 ID",          value=str(member.id),                                 inline=True)
+    audit_embed.add_field(name="📅 Account Age", value=f"{age} days old",                              inline=True)
+    audit_embed.add_field(name="📅 Created",     value=f"<t:{int(member.created_at.timestamp())}:F>",  inline=False)
+    audit_embed.set_thumbnail(url=member.display_avatar.url)
+    audit_embed.set_footer(text=f"Member #{member.guild.member_count}")
+    await send_audit(member.guild, audit_embed)
 
     # ── Welcome image ──
     welcome_channel_id = config.get("welcome_channel_id")
@@ -1789,7 +2409,7 @@ async def ticket_stats(ctx):
         avg_close_str = (f"{avg_minutes:.1f} minutes" if avg_minutes < 60
                          else f"{avg_minutes / 60:.1f} hours" if avg_minutes < 1440
                          else f"{avg_minutes / 1440:.1f} days")
-    ratings       = [t["rating"] for t in tickets.values() if t.get("rating")]
+    ratings        = [t["rating"] for t in tickets.values() if t.get("rating")]
     avg_rating_str = "No ratings yet"
     if ratings:
         avg            = sum(ratings) / len(ratings)
@@ -1809,6 +2429,7 @@ async def ticket_stats(ctx):
     embed.add_field(name="🔒 Closed",        value=str(closed_count), inline=True)
     embed.add_field(name="⏱️ Avg Close Time", value=avg_close_str,    inline=True)
     embed.add_field(name="⭐ Avg Rating",     value=avg_rating_str,   inline=False)
+    embed.add_field(name="⏰ Auto-Close",     value=f"After {TICKET_IDLE_HOURS}h opener inactivity", inline=True)
     if top_categories:
         embed.add_field(name="📋 Top Categories",
                         value="\n".join(f"• {cat}: **{count}**" for cat, count in top_categories),
@@ -1932,7 +2553,7 @@ async def disable_silent(ctx, channel: discord.TextChannel = None):
 
 
 # ─────────────────────────────────────────────────────────
-# ANNOUNCEMENT COMMAND  — with image attachment & color picker
+# ANNOUNCEMENT COMMAND
 # ─────────────────────────────────────────────────────────
 COLOR_MAP = {
     "blue":   discord.Color.blue(),
@@ -1947,33 +2568,13 @@ COLOR_MAP = {
 
 
 class AnnouncementModal(Modal, title="📢 Create Announcement"):
-    ann_title = TextInput(
-        label="Title",
-        placeholder="Announcement title",
-        max_length=200,
-        style=discord.TextStyle.short
-    )
-    ann_description = TextInput(
-        label="Description",
-        placeholder="Write your announcement here...",
-        style=discord.TextStyle.paragraph,
-        max_length=4000
-    )
-    ann_color = TextInput(
-        label="Embed Color",
-        placeholder="blue / red / green / gold / purple / orange / teal / white",
-        default="blue",
-        max_length=10,
-        style=discord.TextStyle.short,
-        required=False
-    )
-    ann_image = TextInput(
-        label="Image URL (optional)",
-        placeholder="https://example.com/image.png",
-        max_length=500,
-        style=discord.TextStyle.short,
-        required=False
-    )
+    ann_title = TextInput(label="Title", placeholder="Announcement title", max_length=200, style=discord.TextStyle.short)
+    ann_description = TextInput(label="Description", placeholder="Write your announcement here...",
+                                style=discord.TextStyle.paragraph, max_length=4000)
+    ann_color = TextInput(label="Embed Color", placeholder="blue / red / green / gold / purple / orange / teal / white",
+                          default="blue", max_length=10, style=discord.TextStyle.short, required=False)
+    ann_image = TextInput(label="Image URL (optional)", placeholder="https://example.com/image.png",
+                          max_length=500, style=discord.TextStyle.short, required=False)
 
     def __init__(self, ctx: commands.Context):
         super().__init__()
@@ -1993,8 +2594,7 @@ class AnnouncementModal(Modal, title="📢 Create Announcement"):
         image_url = (self.ann_image.value or "").strip()
         if image_url:
             embed.set_image(url=image_url)
-
-        config                = load_server_config(self._ctx.guild.id)
+        config                  = load_server_config(self._ctx.guild.id)
         announcement_channel_id = config.get("announcement_channel_id")
         if announcement_channel_id:
             channel = self._ctx.guild.get_channel(announcement_channel_id)
@@ -2002,7 +2602,6 @@ class AnnouncementModal(Modal, title="📢 Create Announcement"):
                 await channel.send(content="@everyone", embed=embed)
                 await interaction.response.send_message(f"✅ Announcement sent to {channel.mention}!", ephemeral=True)
                 return
-        # Fallback: post in current channel
         await self._ctx.channel.send(content="@everyone", embed=embed)
         await interaction.response.send_message("✅ Announcement sent! (No announcement channel set — use `!setup` to configure one.)", ephemeral=True)
 
@@ -2064,10 +2663,11 @@ async def setup(ctx):
         return m.author == ctx.author and m.channel == ctx.channel
 
     steps = [
-        ("verified_role_id",         "🔐 **Step 1:** Paste the **Role ID** for the verified role, or type `skip`:", "role"),
-        ("announcement_channel_id",  "📢 **Step 2:** Paste the **Channel ID** for announcements, or type `skip`:", "channel"),
-        ("stats_channel_id",         "📊 **Step 3:** Paste the **Channel ID** for member count stats, or type `skip`:", "channel"),
-        ("welcome_channel_id",       "👋 **Step 4:** Paste the **Channel ID** for welcome messages/images, or type `skip`:", "channel"),
+        ("verified_role_id",        "🔐 **Step 1:** Paste the **Role ID** for the verified role, or type `skip`:",          "role"),
+        ("announcement_channel_id", "📢 **Step 2:** Paste the **Channel ID** for announcements, or type `skip`:",           "channel"),
+        ("stats_channel_id",        "📊 **Step 3:** Paste the **Channel ID** for member count stats, or type `skip`:",      "channel"),
+        ("welcome_channel_id",      "👋 **Step 4:** Paste the **Channel ID** for welcome messages/images, or type `skip`:", "channel"),
+        ("audit_log_channel_id",    "📋 **Step 5:** Paste the **Channel ID** for the audit log, or type `skip`:",           "channel"),
     ]
     for key, prompt, kind in steps:
         await ctx.send(prompt)
@@ -2095,6 +2695,7 @@ async def setup(ctx):
         "announcement_channel_id": ("📢", "Announcement Channel", "channel"),
         "stats_channel_id":        ("📊", "Stats Channel",        "channel"),
         "welcome_channel_id":      ("👋", "Welcome Channel",      "channel"),
+        "audit_log_channel_id":    ("📋", "Audit Log Channel",    "channel"),
     }
     for k, (icon, label, kind) in label_map.items():
         if config.get(k):
@@ -2134,6 +2735,11 @@ async def userinfo(ctx, member: discord.Member = None):
     if len(roles_str) > 1000:
         roles_str = f"{len(roles)} roles"
 
+    # Warning count
+    warn_data  = load_warnings()
+    warn_key   = _warn_key(ctx.guild.id, member.id)
+    warn_count = len(warn_data.get(warn_key, {}).get("warns", []))
+
     # AFK status
     afk_data   = load_afk()
     afk_status = "None"
@@ -2148,17 +2754,18 @@ async def userinfo(ctx, member: discord.Member = None):
         timestamp=now
     )
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="🪪 Username",        value=str(member),                                inline=True)
-    embed.add_field(name="🆔 User ID",         value=str(member.id),                             inline=True)
-    embed.add_field(name="🤖 Bot?",            value="Yes" if member.bot else "No",               inline=True)
-    embed.add_field(name="📅 Account Created", value=f"<t:{int(member.created_at.timestamp())}:F>\n({account_age_days} days ago)", inline=True)
-    embed.add_field(name="📥 Joined Server",   value=f"<t:{int(member.joined_at.timestamp())}:F>\n({join_age_days} days ago)" if member.joined_at else "Unknown", inline=True)
-    embed.add_field(name="🖼️ Avatar",          value="Custom" if member.avatar else "Default",    inline=True)
-    embed.add_field(name="🔐 Verification Status", value=verify_status,                          inline=True)
-    embed.add_field(name="🛡️ Risk Level",      value=risk_level.capitalize(),                    inline=True)
-    embed.add_field(name="🔑 Verify Method",   value=verify_method.replace("_", " ").title(),    inline=True)
-    embed.add_field(name="💤 AFK Status",      value=afk_status,                                 inline=False)
-    embed.add_field(name=f"🏷️ Roles ({len(roles)})", value=roles_str,                           inline=False)
+    embed.add_field(name="🪪 Username",            value=str(member),                                inline=True)
+    embed.add_field(name="🆔 User ID",             value=str(member.id),                             inline=True)
+    embed.add_field(name="🤖 Bot?",                value="Yes" if member.bot else "No",               inline=True)
+    embed.add_field(name="📅 Account Created",     value=f"<t:{int(member.created_at.timestamp())}:F>\n({account_age_days} days ago)", inline=True)
+    embed.add_field(name="📥 Joined Server",       value=f"<t:{int(member.joined_at.timestamp())}:F>\n({join_age_days} days ago)" if member.joined_at else "Unknown", inline=True)
+    embed.add_field(name="🖼️ Avatar",              value="Custom" if member.avatar else "Default",    inline=True)
+    embed.add_field(name="🔐 Verification Status", value=verify_status,                              inline=True)
+    embed.add_field(name="🛡️ Risk Level",          value=risk_level.capitalize(),                    inline=True)
+    embed.add_field(name="🔑 Verify Method",       value=verify_method.replace("_", " ").title(),    inline=True)
+    embed.add_field(name="⚠️ Warnings",            value=f"{warn_count} warning(s)",                 inline=True)
+    embed.add_field(name="💤 AFK Status",          value=afk_status,                                 inline=False)
+    embed.add_field(name=f"🏷️ Roles ({len(roles)})", value=roles_str,                               inline=False)
     embed.set_footer(text=f"Requested by {ctx.author.display_name}")
     await ctx.send(embed=embed)
 
@@ -2187,17 +2794,17 @@ async def serverinfo(ctx):
     )
     if guild.icon:   embed.set_thumbnail(url=guild.icon.url)
     if guild.banner: embed.set_image(url=guild.banner.url)
-    embed.add_field(name="🆔 Server ID",  value=str(guild.id),                                                     inline=True)
-    embed.add_field(name="👑 Owner",      value=guild.owner.mention if guild.owner else "Unknown",                  inline=True)
+    embed.add_field(name="🆔 Server ID",  value=str(guild.id),                                                      inline=True)
+    embed.add_field(name="👑 Owner",      value=guild.owner.mention if guild.owner else "Unknown",                   inline=True)
     embed.add_field(name="📅 Created",    value=f"<t:{int(guild.created_at.timestamp())}:F>\n({age_days} days ago)", inline=True)
-    embed.add_field(name="👥 Members",    value=f"Total: **{total}**\nHumans: **{humans}**\nBots: **{bots}**",       inline=True)
+    embed.add_field(name="👥 Members",    value=f"Total: **{total}**\nHumans: **{humans}**\nBots: **{bots}**",        inline=True)
     embed.add_field(name="💬 Channels",   value=f"Text: **{text_channels}**\nVoice: **{voice_channels}**\nCategories: **{categories}**", inline=True)
-    embed.add_field(name="🎭 Roles",      value=str(len(guild.roles)),                                               inline=True)
-    embed.add_field(name="🚀 Boost Level",value=f"Level **{boost_level}**",                                         inline=True)
-    embed.add_field(name="💎 Boosts",     value=str(boost_count),                                                   inline=True)
-    embed.add_field(name="😀 Emojis",     value=f"{len(guild.emojis)}/{guild.emoji_limit}",                         inline=True)
-    embed.add_field(name="🔒 Verification Level", value=str(guild.verification_level).replace("_", " ").title(),    inline=True)
-    embed.add_field(name="🌍 Region",     value="Automatic (Discord)",                                               inline=True)
+    embed.add_field(name="🎭 Roles",      value=str(len(guild.roles)),                                                inline=True)
+    embed.add_field(name="🚀 Boost Level",value=f"Level **{boost_level}**",                                          inline=True)
+    embed.add_field(name="💎 Boosts",     value=str(boost_count),                                                    inline=True)
+    embed.add_field(name="😀 Emojis",     value=f"{len(guild.emojis)}/{guild.emoji_limit}",                          inline=True)
+    embed.add_field(name="🔒 Verification Level", value=str(guild.verification_level).replace("_", " ").title(),     inline=True)
+    embed.add_field(name="🌍 Region",     value="Automatic (Discord)",                                                inline=True)
     embed.set_footer(text=f"Requested by {ctx.author.display_name}")
     await ctx.send(embed=embed)
 
@@ -2262,8 +2869,8 @@ class GiveawayModal(Modal, title="🎉 Start a Giveaway"):
             if winners < 1: raise ValueError
         except ValueError:
             return await interaction.response.send_message("❌ Winner count must be a positive whole number.", ephemeral=True)
-        prize    = self.prize_input.value.strip()
-        end_time = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+        prize     = self.prize_input.value.strip()
+        end_time  = datetime.now(timezone.utc) + timedelta(seconds=seconds)
         timestamp = int(end_time.timestamp())
         await interaction.response.send_message(f"✅ Giveaway for **{prize}** started! 🎉", ephemeral=True)
         embed = discord.Embed(
@@ -2341,24 +2948,24 @@ async def flip(ctx):
 
 
 # =========================================================
-# Help Command  (updated with new commands)
+# Help Command
 # =========================================================
 @bot.command(name="help")
 async def help_command(ctx):
     embeds = []
 
-    e1 = discord.Embed(title="🤖 Bot Commands — Page 1/6", color=discord.Color.blurple())
-    e1.add_field(name="**BASIC COMMANDS**",        value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    e1.add_field(name="!help",                     value="Display this help message",                          inline=False)
-    e1.add_field(name="!rules",                    value="Display server rules",                               inline=False)
-    e1.add_field(name="!ticket",                   value="Create a support ticket",                            inline=False)
-    e1.add_field(name="!gstart",                   value="Start a giveaway via interactive menu (Mod+)",       inline=False)
-    e1.add_field(name="!flip",                     value="Flip a coin",                                        inline=False)
-    e1.add_field(name="!uptime",                   value="Show how long the bot has been running",             inline=False)
-    e1.add_field(name="!afk [reason]",             value="Set yourself as AFK — bot will notify pings",        inline=False)
+    e1 = discord.Embed(title="🤖 Bot Commands — Page 1/7", color=discord.Color.blurple())
+    e1.add_field(name="**BASIC COMMANDS**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    e1.add_field(name="!help",              value="Display this help message",                    inline=False)
+    e1.add_field(name="!rules",             value="Display server rules",                         inline=False)
+    e1.add_field(name="!ticket",            value="Create a support ticket",                      inline=False)
+    e1.add_field(name="!gstart",            value="Start a giveaway via interactive menu (Mod+)", inline=False)
+    e1.add_field(name="!flip",              value="Flip a coin",                                  inline=False)
+    e1.add_field(name="!uptime",            value="Show how long the bot has been running",       inline=False)
+    e1.add_field(name="!afk [reason]",      value="Set yourself as AFK — bot will notify pings", inline=False)
     embeds.append(e1)
 
-    e2 = discord.Embed(title="🔴 Bot Commands — Page 2/6", color=0x53FC18)
+    e2 = discord.Embed(title="🔴 Bot Commands — Page 2/7", color=0x53FC18)
     e2.add_field(name="**KICK LIVE ANNOUNCEMENT**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
     e2.add_field(name="!live",
                  value=("Opens an interactive live announcement menu.\n\n"
@@ -2369,67 +2976,84 @@ async def help_command(ctx):
                  inline=False)
     embeds.append(e2)
 
-    e3 = discord.Embed(title="🛡️ Bot Commands — Page 3/6", color=discord.Color.orange())
+    e3 = discord.Embed(title="🛡️ Bot Commands — Page 3/7", color=discord.Color.orange())
     e3.add_field(name="**MODERATION (Mod/Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    e3.add_field(name="!mute <@user> <time> [reason]",    value="Temp-mute a member  e.g. `!mute @user 30m Spamming`", inline=False)
-    e3.add_field(name="!unmute <@user>",                  value="Manually unmute a member",                             inline=False)
-    e3.add_field(name="!tempban <@user> <time> [reason]", value="Temporarily ban a member  e.g. `!tempban @user 1d`",  inline=False)
-    e3.add_field(name="**ANTI-SPAM (Admin)**",       value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    e3.add_field(name="!spam_info",                  value="Display anti-spam settings and muted users", inline=False)
-    e3.add_field(name="!unmute_user <@user>",        value="Manually unmute a spam-muted user",          inline=False)
-    e3.add_field(name="!spam_config <m> <i> <t>",   value="Configure anti-spam thresholds",              inline=False)
-    e3.add_field(name="**SILENT CHANNELS (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    e3.add_field(name="!silent_channels",            value="View silent channels",                        inline=False)
-    e3.add_field(name="!enable_silent [#channel]",   value="Enable silent mode",                          inline=False)
-    e3.add_field(name="!disable_silent [#channel]",  value="Disable silent mode",                         inline=False)
+    e3.add_field(name="!mute <@user> <time> [reason]",    value="Temp-mute a member  e.g. `!mute @user 30m Spamming`",  inline=False)
+    e3.add_field(name="!unmute <@user>",                  value="Manually unmute a member",                              inline=False)
+    e3.add_field(name="!tempban <@user> <time> [reason]", value="Temporarily ban a member  e.g. `!tempban @user 1d`",   inline=False)
+    e3.add_field(name="!slowmode <time> [#channel]",      value="Set slowmode  e.g. `!slowmode 30s` or `!slowmode off`", inline=False)
+    e3.add_field(name="**WARNING SYSTEM (Mod/Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    e3.add_field(name="!warn <@user> [reason]",    value="Warn a member — auto-punishments at 3/5/7/10 warns",       inline=False)
+    e3.add_field(name="!warnings [@user]",         value="View warnings (defaults to yourself)",                      inline=False)
+    e3.add_field(name="!clearwarns <@user> [#]",  value="Clear all warns or a specific one  e.g. `!clearwarns @user 2`", inline=False)
+    e3.add_field(name="**ANTI-SPAM (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    e3.add_field(name="!spam_info",               value="Display anti-spam settings and muted users", inline=False)
+    e3.add_field(name="!unmute_user <@user>",     value="Manually unmute a spam-muted user",          inline=False)
+    e3.add_field(name="!spam_config <m> <i> <t>", value="Configure anti-spam thresholds",             inline=False)
     embeds.append(e3)
 
-    e4 = discord.Embed(title="💰 Bot Commands — Page 4/6", color=discord.Color.green())
-    e4.add_field(name="**PAYMENT TRACKING (Admin)**",  value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    e4.add_field(name="!pay <username> <amount>",      value="Record a payment",                               inline=False)
-    e4.add_field(name="!pay_add <username> <amount>",  value="Add an amount owed to a user",                   inline=False)
-    e4.add_field(name="!pay_remove <username>",        value="Remove a user from the tracker",                 inline=False)
-    e4.add_field(name="!pay_list",                     value="Display all payment balances",                   inline=False)
-    e4.add_field(name="!pay_reset",                    value="Reset all payment data",                         inline=False)
-    e4.add_field(name="**VERIFICATION (Admin)**",      value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    e4.add_field(name="!verify [member]",              value="Manually verify a member",                       inline=False)
-    e4.add_field(name="!sendverify",                   value="Send the verification button embed",             inline=False)
-    e4.add_field(name="**CUSTOM COMMANDS (Admin)**",   value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    e4.add_field(name="!addcmd <name> <response>",     value="Add a custom command  e.g. `!addcmd discord Join discord.gg/example`", inline=False)
-    e4.add_field(name="!removecmd <name>",             value="Remove a custom command",                        inline=False)
-    e4.add_field(name="!listcmds",                     value="List all custom commands for this server",       inline=False)
+    e4 = discord.Embed(title="📅 Bot Commands — Page 4/7", color=discord.Color.blue())
+    e4.add_field(name="**SCHEDULED ANNOUNCEMENTS (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    e4.add_field(name="!schedule #channel <time> <message>",
+                 value="Schedule an announcement  e.g. `!schedule #general 2h Event in 30min!`\nAdd `--everyone` at the end to ping @everyone",
+                 inline=False)
+    e4.add_field(name="!schedule_list",     value="View all pending scheduled announcements", inline=False)
+    e4.add_field(name="!schedule_cancel #", value="Cancel a scheduled announcement by number", inline=False)
+    e4.add_field(name="**AUDIT LOG (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    e4.add_field(name="!setauditlog #channel",
+                 value="Set the audit log channel — tracks edits, deletes, joins, leaves, bans, role changes, slowmode, warns",
+                 inline=False)
+    e4.add_field(name="!setauditlog", value="View the current audit log channel", inline=False)
+    e4.add_field(name="**SILENT CHANNELS (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    e4.add_field(name="!silent_channels",          value="View silent channels",     inline=False)
+    e4.add_field(name="!enable_silent [#channel]", value="Enable silent mode",       inline=False)
+    e4.add_field(name="!disable_silent [#channel]", value="Disable silent mode",     inline=False)
     embeds.append(e4)
 
-    e5 = discord.Embed(title="📊 Bot Commands — Page 5/6", color=discord.Color.teal())
-    e5.add_field(name="**UTILITY COMMANDS**",          value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    e5.add_field(name="!userinfo [member]",            value="Show detailed member info including AFK status", inline=False)
-    e5.add_field(name="!serverinfo",                   value="Show server stats",                              inline=False)
-    e5.add_field(name="!remindme <time> <message>",    value="Set a DM reminder  e.g. `!remindme 30m Check oven`", inline=False)
-    e5.add_field(name="**TICKET TOOLS (Staff)**",      value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    e5.add_field(name="!ticket_stats",                 value="View ticket statistics",                         inline=False)
-    e5.add_field(name="**SERVER MANAGEMENT (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    e5.add_field(name="!setup",                        value="Interactive server config wizard (now includes welcome channel)", inline=False)
-    e5.add_field(name="!delete <number>",              value="Bulk delete messages",                           inline=False)
-    e5.add_field(name="!announcement",                 value="Create a rich announcement with color & image",  inline=False)
+    e5 = discord.Embed(title="💰 Bot Commands — Page 5/7", color=discord.Color.green())
+    e5.add_field(name="**PAYMENT TRACKING (Admin)**",  value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    e5.add_field(name="!pay <username> <amount>",      value="Record a payment",                    inline=False)
+    e5.add_field(name="!pay_add <username> <amount>",  value="Add an amount owed to a user",        inline=False)
+    e5.add_field(name="!pay_remove <username>",        value="Remove a user from the tracker",      inline=False)
+    e5.add_field(name="!pay_list",                     value="Display all payment balances",        inline=False)
+    e5.add_field(name="!pay_reset",                    value="Reset all payment data",              inline=False)
+    e5.add_field(name="**VERIFICATION (Admin)**",      value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    e5.add_field(name="!verify [member]",              value="Manually verify a member",            inline=False)
+    e5.add_field(name="!sendverify",                   value="Send the verification button embed",  inline=False)
+    e5.add_field(name="**CUSTOM COMMANDS (Admin)**",   value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    e5.add_field(name="!addcmd <name> <response>",     value="Add a custom command",               inline=False)
+    e5.add_field(name="!removecmd <name>",             value="Remove a custom command",             inline=False)
+    e5.add_field(name="!listcmds",                     value="List all custom commands",            inline=False)
     embeds.append(e5)
 
-    e6 = discord.Embed(title="📖 Bot Commands — Page 6/6", color=discord.Color.blurple())
-    e6.add_field(name="**NEW FEATURES SUMMARY**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    e6.add_field(name="🔇 Temp-Mute / Temp-Ban",
-                 value="Time-based punishments. Mute auto-lifts when the timer expires. Bot creates the Muted role automatically.", inline=False)
-    e6.add_field(name="🖼️ Welcome Images",
-                 value="Auto-generated welcome banners when members join. Set a welcome channel in `!setup`.", inline=False)
-    e6.add_field(name="💤 AFK System",
-                 value="Set AFK with `!afk [reason]`. Bot notifies anyone who pings you. Auto-removed when you send a message.", inline=False)
-    e6.add_field(name="📋 Custom Commands",
-                 value="Create server-specific commands with `!addcmd`. Responds instantly when triggered.", inline=False)
-    e6.add_field(name="📢 Improved Announcements",
-                 value="New modal-based flow with color picker (blue/red/green/gold/purple/orange/teal/white) and optional image URL.", inline=False)
-    e6.add_field(name="🎫 Ticket Templates",
-                 value="Each ticket category now shows a pre-filled question template to help users provide the right info.", inline=False)
-    e6.add_field(name="**SUPPORT**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
-    e6.add_field(name="Support Server", value="[Join our support server](https://discord.gg/5FrwQAwF6N)", inline=False)
+    e6 = discord.Embed(title="📊 Bot Commands — Page 6/7", color=discord.Color.teal())
+    e6.add_field(name="**UTILITY COMMANDS**",       value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    e6.add_field(name="!userinfo [member]",         value="Show detailed member info including warns & AFK status", inline=False)
+    e6.add_field(name="!serverinfo",                value="Show server stats",                                      inline=False)
+    e6.add_field(name="!remindme <time> <message>", value="Set a DM reminder  e.g. `!remindme 30m Check oven`",    inline=False)
+    e6.add_field(name="**TICKET TOOLS (Staff)**",   value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    e6.add_field(name="!ticket_stats",              value="View ticket statistics including avg close time & ratings", inline=False)
+    e6.add_field(name="**SERVER MANAGEMENT (Admin)**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    e6.add_field(name="!setup",      value="Interactive server config wizard (5 steps including audit log)", inline=False)
+    e6.add_field(name="!delete <n>", value="Bulk delete messages",                                           inline=False)
+    e6.add_field(name="!announcement", value="Create a rich announcement with color & image",                inline=False)
     embeds.append(e6)
+
+    e7 = discord.Embed(title="📖 Bot Commands — Page 7/7", color=discord.Color.blurple())
+    e7.add_field(name="**NEW FEATURES SUMMARY**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    e7.add_field(name="⚠️ Warning System",
+                 value="!warn with escalating auto-punishments (3→mute 1h, 5→mute 24h, 7→kick, 10→ban). Fully configurable in WARN_THRESHOLDS.", inline=False)
+    e7.add_field(name="📅 Scheduled Announcements",
+                 value="Schedule any message to any channel at any future time. Supports @everyone pings. Survives bot restarts.", inline=False)
+    e7.add_field(name="📋 Audit Log",
+                 value="Full server event logging — edits, deletes, joins, leaves, bans, role changes, nickname changes, slowmode, warns, mutes.", inline=False)
+    e7.add_field(name="🐢 Slowmode",
+                 value="Set slowmode on any channel with any duration. Changes are logged to the audit channel.", inline=False)
+    e7.add_field(name="🔒 Ticket Auto-Close",
+                 value=f"Tickets auto-close after **{TICKET_IDLE_HOURS}h** if the opener hasn't replied. Staff replies don't reset the timer — only the opener's messages do.", inline=False)
+    e7.add_field(name="**SUPPORT**", value="━━━━━━━━━━━━━━━━━━━━", inline=False)
+    e7.add_field(name="Support Server", value="[Join our support server](https://discord.gg/5FrwQAwF6N)", inline=False)
+    embeds.append(e7)
 
     for embed in embeds:
         await ctx.send(embed=embed)
